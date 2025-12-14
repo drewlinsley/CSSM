@@ -1,0 +1,15 @@
+# Core JAX/ML dependencies
+jax[cuda12_pip]
+flax
+optax
+
+# Data loading
+tensorflow-datasets
+tensorflow
+
+# Training utilities
+tqdm
+orbax-checkpoint
+
+# Experiment tracking
+wandb
