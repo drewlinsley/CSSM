@@ -7,6 +7,7 @@ These operations perform arithmetic in log-space for numerical stability,
 using the max-subtraction trick for log-sum-exp style computations.
 """
 
+import jax
 import jax.numpy as jnp
 from typing import Optional, Union
 
@@ -18,7 +19,7 @@ def log_add_exp(log_x1: jnp.ndarray, log_x2: jnp.ndarray) -> jnp.ndarray:
     Add two values in log-space: log(exp(log_x1) + exp(log_x2)).
 
     Uses the max-subtraction trick for numerical stability:
-    1. Subtract the maximum
+    1. Subtract the maximum (with stop_gradient to prevent gradient discontinuities)
     2. Convert from GOOM and add
     3. Convert back to GOOM
     4. Add the maximum back
@@ -30,8 +31,9 @@ def log_add_exp(log_x1: jnp.ndarray, log_x2: jnp.ndarray) -> jnp.ndarray:
     Returns:
         Sum in GOOM representation
     """
-    # Find maximum for numerical stability
-    c = jnp.maximum(goom_real(log_x1), goom_real(log_x2))
+    # CRITICAL: stop_gradient prevents gradients from flowing through the max
+    # selection, which avoids gradient discontinuities (per paper/GOOM reference)
+    c = jax.lax.stop_gradient(jnp.maximum(goom_real(log_x1), goom_real(log_x2)))
 
     # Subtract max, convert to linear space, add, convert back
     x = from_goom(log_x1 - c) + from_goom(log_x2 - c)
@@ -50,8 +52,8 @@ def log_sum_exp(log_x: jnp.ndarray, axis: Optional[int] = None) -> jnp.ndarray:
     Returns:
         Sum in GOOM representation
     """
-    # Find maximum for numerical stability
-    c = jnp.max(goom_real(log_x), axis=axis, keepdims=True)
+    # CRITICAL: stop_gradient prevents gradient discontinuities from max
+    c = jax.lax.stop_gradient(jnp.max(goom_real(log_x), axis=axis, keepdims=True))
 
     # Subtract max, convert to linear space, sum, convert back
     x = from_goom(log_x - c).sum(axis=axis)
@@ -72,7 +74,8 @@ def log_sub_exp(log_x1: jnp.ndarray, log_x2: jnp.ndarray) -> jnp.ndarray:
     Returns:
         Difference in GOOM representation
     """
-    c = jnp.maximum(goom_real(log_x1), goom_real(log_x2))
+    # CRITICAL: stop_gradient prevents gradient discontinuities from max
+    c = jax.lax.stop_gradient(jnp.maximum(goom_real(log_x1), goom_real(log_x2)))
     x = from_goom(log_x1 - c) - from_goom(log_x2 - c)
     return to_goom(x) + c
 

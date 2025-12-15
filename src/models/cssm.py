@@ -55,17 +55,17 @@ class StandardCSSM(nn.Module):
             head_dim = 32
             num_heads = max(1, C // head_dim)
 
-            # Param shape: (num_heads, kernel_size, kernel_size, head_dim)
+            # Param shape: (num_heads, kernel_size, kernel_size)
+            # Each head's kernel is shared across head_dim channels
             k_param = self.param(
                 'kernel',
                 nn.initializers.normal(0.02),
-                (num_heads, self.kernel_size, self.kernel_size, head_dim)
+                (num_heads, self.kernel_size, self.kernel_size)
             )
 
-            # Reshape and broadcast heads to match channels
-            # (num_heads, K, K, head_dim) -> (C, K, K)
+            # Broadcast heads to match channels
+            # (num_heads, K, K) -> (C, K, K) by repeating each kernel
             k_spatial = jnp.repeat(k_param, C // num_heads, axis=0)
-            k_spatial = k_spatial.reshape(C, self.kernel_size, self.kernel_size)
         else:
             # Independent Depthwise: each channel has its own kernel
             k_spatial = self.param(
@@ -103,7 +103,9 @@ class StandardCSSM(nn.Module):
 
         # --- 3. Cepstral Scan ---
         # Convert to GOOM representation (numerically stable log-space)
-        K_log = to_goom(K_hat)[None, None, ...]  # Broadcast over B, T
+        K_log = to_goom(K_hat)  # (C, H, W_freq)
+        # Broadcast to match input shape: (C, H, W_f) -> (B, T, C, H, W_f)
+        K_log = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
         U_log = to_goom(U_hat)
 
         # Scan over time dimension (axis 1)
@@ -161,9 +163,9 @@ class GatedOpponentCSSM(nn.Module):
         alpha = nn.sigmoid(nn.Dense(C, name='alpha_gate')(ctx))  # X decay
         delta = nn.sigmoid(nn.Dense(C, name='delta_gate')(ctx))  # Y decay
 
-        # Coupling Gates (Off-diagonal elements)
-        mu = nn.softplus(nn.Dense(C, name='mu_gate')(ctx))      # Inhibition X->Y
-        gamma = nn.softplus(nn.Dense(C, name='gamma_gate')(ctx)) # Excitation Y->X
+        # Coupling Gates (Off-diagonal elements) - sigmoid bounds to [0,1] for stability
+        mu = nn.sigmoid(nn.Dense(C, name='mu_gate')(ctx))      # Inhibition X->Y
+        gamma = nn.sigmoid(nn.Dense(C, name='gamma_gate')(ctx)) # Excitation Y->X
 
         # --- 2. Learnable Decay Parameter ---
         # Base decay is learnable per-channel (initialized near 0.9)
@@ -221,10 +223,11 @@ class GatedOpponentCSSM(nn.Module):
         # A_yx = K_E * gamma (excitation from X to Y)
         # A_yy = decay * delta (self-connection for Y)
 
-        A_xx = decay_complex * b_alpha
+        # Broadcast diagonal terms to spatial dimensions (B, T, C, H, W_f)
+        A_xx = decay_complex * b_alpha * jnp.ones_like(K_E)
         A_xy = -1.0 * K_I * b_mu  # Negative for inhibition
         A_yx = K_E * b_gamma
-        A_yy = decay_complex * b_delta
+        A_yy = decay_complex * b_delta * jnp.ones_like(K_E)
 
         # Stack into (B, T, C, H, W_f, 2, 2)
         row0 = jnp.stack([A_xx, A_xy], axis=-1)
@@ -237,9 +240,8 @@ class GatedOpponentCSSM(nn.Module):
         U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_f)
 
         # Input drives X channel (index 0), Y channel gets zero input
-        # Use small positive value instead of zero to avoid log(0)
-        small_val = jnp.full_like(U_hat, 1e-10)
-        U_vec = jnp.stack([U_hat, small_val], axis=-1)  # (..., 2)
+        # log(0) = -inf is fine because exp(-inf) = 0 in the LSE
+        U_vec = jnp.stack([U_hat, jnp.zeros_like(U_hat)], axis=-1)  # (..., 2)
 
         # --- 6. Log-Space Scan (using GOOM) ---
         K_log = to_goom(K_mat)

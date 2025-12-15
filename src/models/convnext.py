@@ -11,6 +11,7 @@ And a ModelFactory to build all 8 model variants.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from typing import Type, Optional
 
@@ -247,9 +248,9 @@ class ModelFactory(nn.Module):
         # Stage dimensions (ConvNeXt-Tiny style)
         dims = [96, 192, 384, 768]
 
-        # Calculate drop path rates for each block
+        # Calculate drop path rates for each block (use numpy for concrete values)
         total_blocks = sum(self.depths)
-        dp_rates = jnp.linspace(0, self.drop_path_rate, total_blocks)
+        dp_rates = np.linspace(0, self.drop_path_rate, total_blocks)
         block_idx = 0
 
         # --- Stem (Patchify) ---

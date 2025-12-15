@@ -244,6 +244,11 @@ def main():
     parser.add_argument('--save_every', type=int, default=5,
                         help='Save checkpoint every N epochs')
 
+    # Data
+    parser.add_argument('--data_dir', type=str,
+                        default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
+                        help='Path to imagenette2-320 dataset directory')
+
     # Misc
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -278,6 +283,7 @@ def main():
     total_steps = steps_per_epoch * args.epochs
 
     print(f"Dataset: Imagenette")
+    print(f"  Data dir: {args.data_dir}")
     print(f"  Train samples: {train_size}")
     print(f"  Num classes: {num_classes}")
     print(f"  Steps per epoch: {steps_per_epoch}")
@@ -308,8 +314,8 @@ def main():
     if not args.no_wandb:
         wandb.config.update({'num_params': num_params})
 
-    # Setup checkpointing
-    checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
+    # Setup checkpointing (must be absolute path for orbax)
+    checkpoint_dir = os.path.abspath(os.path.join(args.checkpoint_dir, run_name))
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     checkpointer = ocp.StandardCheckpointer()
@@ -324,6 +330,7 @@ def main():
 
         # Create fresh data loaders each epoch
         train_loader = get_imagenette_video_loader(
+            data_dir=args.data_dir,
             batch_size=args.batch_size,
             sequence_length=args.seq_len,
             split='train',
@@ -370,9 +377,10 @@ def main():
         # Validation
         if (epoch + 1) % args.eval_every == 0:
             val_loader = get_imagenette_video_loader(
+                data_dir=args.data_dir,
                 batch_size=args.batch_size,
                 sequence_length=args.seq_len,
-                split='validation',
+                split='val',
             )
             val_metrics = evaluate(state, val_loader, num_classes)
 

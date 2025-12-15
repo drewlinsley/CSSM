@@ -158,17 +158,20 @@ def to_goom(x: jax.Array) -> jax.Array:
 
 def from_goom(log_x: jax.Array) -> jax.Array:
     """
-    Convert GOOM representation back to float values.
+    Convert GOOM representation back to original values.
+
+    For real-valued inputs that went through to_goom, the result will be
+    essentially real (with negligible imaginary parts from floating point).
+    For complex inputs (e.g., FFT coefficients), the full complex value
+    is preserved.
 
     Args:
         log_x: Tensor in GOOM (complex log) representation
 
     Returns:
-        Real tensor with original values recovered
+        Tensor with original values recovered (complex if input was complex)
     """
-    result = goom_exp(log_x)
-    # Extract real part (imaginary should be ~0 for valid GOOM values)
-    return result.real if jnp.iscomplexobj(result) else result
+    return goom_exp(log_x)
 
 
 # =============================================================================
