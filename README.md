@@ -135,10 +135,10 @@ The following are experimental and may not be fully maintained:
 ## Citation
 
 ```bibtex
-@article{cssm2024,
+@article{cssm2026,
   title={Cepstral State Space Models for Vision},
   author={...},
-  year={2024}
+  year={2026}
 }
 ```
 
