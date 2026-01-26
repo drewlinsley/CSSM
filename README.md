@@ -33,7 +33,8 @@ python main.py --arch simple --cssm hgru_bi --dataset pathfinder \
     --pathfinder_difficulty 14 \
     --tfrecord_dir /path/to/pathfinder_tfrecords/difficulty_14 \
     --batch_size 256 --seq_len 8 --depth 1 --embed_dim 32 \
-    --kernel_size 11 --lr 3e-4 --epochs 60 --bf16
+    --kernel_size 11 --lr 3e-4 --epochs 60 \
+    --pos_embed spatiotemporal --bf16
 ```
 
 ### ImageNet

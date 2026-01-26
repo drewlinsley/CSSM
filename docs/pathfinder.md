@@ -51,7 +51,8 @@ python main.py --arch simple --cssm hgru_bi --dataset pathfinder \
     --pathfinder_difficulty 14 \
     --data_dir /path/to/pathfinder \
     --batch_size 256 --seq_len 8 --depth 1 --embed_dim 32 \
-    --kernel_size 11 --lr 3e-4 --epochs 60
+    --kernel_size 11 --lr 3e-4 --epochs 60 \
+    --pos_embed spatiotemporal
 ```
 
 ## Key Hyperparameters
@@ -60,6 +61,7 @@ python main.py --arch simple --cssm hgru_bi --dataset pathfinder \
 |-----------|-------------|-------|
 | `--arch` | `simple` | Minimal architecture for this task |
 | `--cssm` | `hgru_bi` | 3x3 opponent dynamics |
+| `--pos_embed` | `spatiotemporal` | **Essential** - required to learn the task |
 | `--depth` | `1` | Single CSSM block sufficient |
 | `--embed_dim` | `32` | Small dimension works well |
 | `--seq_len` | `8` | Temporal recurrence steps |
