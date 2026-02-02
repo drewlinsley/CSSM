@@ -49,7 +49,11 @@ def apply_rope(x: jnp.ndarray, mode: str = 'spatiotemporal', base: float = 10000
 
     Args:
         x: Input tensor (B, T, H, W, C) - in spatial domain before FFT
-        mode: 'spatiotemporal' (H, W, T), 'temporal' (T only), or 'none'
+        mode: Position encoding mode:
+            - 'spatiotemporal': Combined H, W, T encoding (VideoRoPE style)
+            - 'spatial_only': Only H, W encoding, no temporal (better length generalization)
+            - 'temporal': Only T encoding
+            - 'none': No position encoding
         base: Base for frequency computation (default 10000.0)
 
     Returns:
@@ -72,6 +76,36 @@ def apply_rope(x: jnp.ndarray, mode: str = 'spatiotemporal', base: float = 10000
         t_pos = jnp.arange(T)  # (T,)
         theta = jnp.outer(t_pos, inv_freq)  # (T, C/2)
         theta = theta[:, None, None, :]  # (T, 1, 1, C/2) for broadcast
+
+    elif mode == 'spatial_only':
+        # Spatial-only: rotate by (h, w) position, no temporal encoding
+        # This allows better length generalization since recurrence encodes time
+        # Split frequencies between h and w (interleaved for diagonal layout)
+        inv_freq_h = inv_freq[0::2]
+        inv_freq_w = inv_freq[1::2]
+
+        h_pos = jnp.arange(H)
+        w_pos = jnp.arange(W)
+
+        theta_h = jnp.outer(h_pos, inv_freq_h)  # (H, n_freq/2)
+        theta_w = jnp.outer(w_pos, inv_freq_w)  # (W, n_freq/2)
+
+        # Pad to C/2
+        def pad_right(arr, target_len):
+            curr_len = arr.shape[-1]
+            if curr_len < target_len:
+                pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, target_len - curr_len)]
+                return jnp.pad(arr, pad_width)
+            return arr
+
+        theta_h_padded = pad_right(theta_h, n_freq)  # (H, C/2)
+        theta_w_padded = pad_right(theta_w, n_freq)  # (W, C/2)
+
+        # Combine: (H, W, C/2) - same for all timesteps (no temporal component)
+        theta = (theta_h_padded[:, None, :] +
+                 theta_w_padded[None, :, :])
+        # Broadcast to (1, H, W, C/2) for proper broadcasting with x
+        theta = theta[None, :, :, :]
 
     else:  # spatiotemporal - following VideoRoPE
         # VideoRoPE insight: allocate LOW frequencies to temporal, HIGH to spatial
@@ -117,7 +151,7 @@ def apply_rope(x: jnp.ndarray, mode: str = 'spatiotemporal', base: float = 10000
                  theta_w_padded[None, None, :, :])
 
     # Apply rotation to channel pairs
-    cos_theta = jnp.cos(theta)  # (T, H, W, C/2) or (T, 1, 1, C/2)
+    cos_theta = jnp.cos(theta)  # (T, H, W, C/2) or (T, 1, 1, C/2) or (1, H, W, C/2)
     sin_theta = jnp.sin(theta)
 
     # Split channels into even/odd pairs
@@ -133,6 +167,94 @@ def apply_rope(x: jnp.ndarray, mode: str = 'spatiotemporal', base: float = 10000
     x_rot = x_rot.reshape(B, T, H, W, C)
 
     return x_rot
+
+
+def apply_learned_temporal_encoding(x: jnp.ndarray, temporal_embed: jnp.ndarray) -> jnp.ndarray:
+    """
+    Apply learned temporal position encoding (additive, not rotational).
+
+    This is used with 'separate' position encoding mode where spatial uses RoPE
+    and temporal uses learned embeddings that can interpolate for length generalization.
+
+    Args:
+        x: Input tensor (B, T, H, W, C)
+        temporal_embed: Learned temporal embeddings (max_T, C)
+
+    Returns:
+        Position-encoded tensor (B, T, H, W, C)
+    """
+    B, T, H, W, C = x.shape
+    max_T = temporal_embed.shape[0]
+
+    if T <= max_T:
+        # Use embeddings directly (or slice if T < max_T)
+        t_embed = temporal_embed[:T]  # (T, C)
+    else:
+        # Interpolate for longer sequences
+        # Use linear interpolation in embedding space
+        indices = jnp.linspace(0, max_T - 1, T)
+        lower_idx = jnp.floor(indices).astype(jnp.int32)
+        upper_idx = jnp.minimum(lower_idx + 1, max_T - 1)
+        alpha = indices - lower_idx
+
+        lower_embed = temporal_embed[lower_idx]  # (T, C)
+        upper_embed = temporal_embed[upper_idx]  # (T, C)
+        t_embed = lower_embed * (1 - alpha[:, None]) + upper_embed * alpha[:, None]
+
+    # Add temporal embedding: (T, C) -> (1, T, 1, 1, C)
+    t_embed = t_embed[None, :, None, None, :]
+    return x + t_embed
+
+
+def get_sinusoidal_temporal_encoding(seq_len: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
+    """
+    Generate sinusoidal temporal position encoding (like original Transformer).
+
+    Unlike learned embeddings, sinusoidal encodings naturally extrapolate to
+    longer sequences without interpolation artifacts.
+
+    Args:
+        seq_len: Number of timesteps
+        dim: Embedding dimension
+        base: Base for frequency computation (default 10000.0)
+
+    Returns:
+        Position encoding (seq_len, dim)
+    """
+    position = jnp.arange(seq_len)[:, None]  # (T, 1)
+    div_term = jnp.exp(jnp.arange(0, dim, 2) * (-jnp.log(base) / dim))  # (dim/2,)
+
+    # Compute sin for even indices, cos for odd indices
+    pe_sin = jnp.sin(position * div_term)  # (T, dim/2)
+    pe_cos = jnp.cos(position * div_term)  # (T, dim/2)
+
+    # Interleave sin and cos: [sin0, cos0, sin1, cos1, ...]
+    pe = jnp.stack([pe_sin, pe_cos], axis=-1).reshape(seq_len, -1)  # (T, dim)
+
+    # Handle odd dim (trim if necessary)
+    return pe[:, :dim]
+
+
+def apply_sinusoidal_temporal_encoding(x: jnp.ndarray, base: float = 10000.0) -> jnp.ndarray:
+    """
+    Apply sinusoidal temporal position encoding (additive).
+
+    This is used with 'sinusoidal' position encoding mode where spatial uses RoPE
+    and temporal uses sinusoidal embeddings that naturally extrapolate to longer sequences.
+
+    Args:
+        x: Input tensor (B, T, H, W, C)
+        base: Base for frequency computation
+
+    Returns:
+        Position-encoded tensor (B, T, H, W, C)
+    """
+    B, T, H, W, C = x.shape
+    t_embed = get_sinusoidal_temporal_encoding(T, C, base)  # (T, C)
+
+    # Add temporal embedding: (T, C) -> (1, T, 1, 1, C)
+    t_embed = t_embed[None, :, None, None, :]
+    return x + t_embed
 
 
 def apply_temporal_rope_to_context(ctx: jnp.ndarray, base: float = 10000.0) -> jnp.ndarray:
@@ -336,6 +458,7 @@ class GatedCSSM(nn.Module):
     gate_rank: int = 0  # Unused, for API compatibility with GatedOpponentCSSM
     rope_base: float = 10000.0
     concat_xy: bool = True  # Unused, for API compatibility
+    position_independent_gates: bool = False  # If True, compute gates from raw input (before pos encoding)
 
     def _compute_gate(self, x: jnp.ndarray) -> jnp.ndarray:
         """Compute input-dependent gate with specified activation."""
@@ -362,6 +485,9 @@ class GatedCSSM(nn.Module):
         B, T, H, W, C = x.shape
         W_freq = W // 2 + 1  # rfft2 output width
 
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
         # === Apply RoPE before FFT (VideoRoPE style) ===
         if self.rope_mode != 'none':
             x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
@@ -370,14 +496,14 @@ class GatedCSSM(nn.Module):
         if self.dense_mixing:
             if self.mixing_rank > 0:
                 # Low-rank channel mixing (efficient)
-                return self._forward_lowrank_mixing(x, B, T, H, W, C, W_freq)
+                return self._forward_lowrank_mixing(x, B, T, H, W, C, W_freq, x_raw=x_raw)
             else:
                 # Full LMME (expensive, original implementation)
-                return self._forward_dense_mixing(x, B, T, H, W, C, W_freq)
+                return self._forward_dense_mixing(x, B, T, H, W, C, W_freq, x_raw=x_raw)
         else:
-            return self._forward_depthwise(x, B, T, H, W, C, W_freq)
+            return self._forward_depthwise(x, B, T, H, W, C, W_freq, x_raw=x_raw)
 
-    def _forward_depthwise(self, x, B, T, H, W, C, W_freq):
+    def _forward_depthwise(self, x, B, T, H, W, C, W_freq, x_raw=None):
         """Depthwise forward pass - each channel independent."""
 
         # --- 1. Kernel Generation (depthwise) ---
@@ -412,7 +538,10 @@ class GatedCSSM(nn.Module):
         U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
 
         # --- 4. Input-Dependent Gates (Mamba-style) ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C)
+        # Use raw input (before position encoding) for gates if position_independent_gates is True
+        # This makes gates invariant to sequence position, improving length generalization
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C)
 
         # Per-frequency decay gate
         delta_raw = nn.Dense(H * W_freq, name='delta_gate')(ctx)
@@ -450,7 +579,7 @@ class GatedCSSM(nn.Module):
 
         return x_out.transpose(0, 1, 3, 4, 2)
 
-    def _forward_lowrank_mixing(self, x, B, T, H, W, C, W_freq):
+    def _forward_lowrank_mixing(self, x, B, T, H, W, C, W_freq, x_raw=None):
         """
         Low-rank channel mixing: depthwise scan + low-rank projection.
 
@@ -530,7 +659,9 @@ class GatedCSSM(nn.Module):
         U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
 
         # --- 5. Input-Dependent Gates ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C)
+        # Use raw input (before position encoding) for gates if position_independent_gates is True
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C)
 
         delta_raw = nn.Dense(H * W_freq, name='delta_gate')(ctx)
         delta_raw = delta_raw.reshape(B, T, H * W_freq)
@@ -585,7 +716,7 @@ class GatedCSSM(nn.Module):
 
         return x_out.transpose(0, 1, 3, 4, 2)
 
-    def _forward_dense_mixing(self, x, B, T, H, W, C, W_freq):
+    def _forward_dense_mixing(self, x, B, T, H, W, C, W_freq, x_raw=None):
         """
         Dense mixing forward pass - LMME channel mixing.
 
@@ -646,7 +777,9 @@ class GatedCSSM(nn.Module):
 
         # --- 4. Input-Dependent Gates ---
         # Pool spatial dims for gating context: (B, T, C_padded) - use full channel context
-        ctx = x.mean(axis=(2, 3))  # (B, T, C_padded)
+        # Use raw input (before position encoding) for gates if position_independent_gates is True
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C_padded)
 
         # Per-frequency, per-block decay gate
         n_gate_feats = num_blocks * H * W_freq
@@ -2405,6 +2538,7 @@ class TransformerCSSM(nn.Module):
     rope_base: float = 10000.0
     readout_state: str = 'qka'  # 'qka', 'q', 'k', 'a', 'qk', 'qa', 'ka'
     pre_output_act: str = 'none'
+    position_independent_gates: bool = False  # Compute gates from raw input for length generalization
     # Unused but kept for API compatibility
     gate_activation: str = 'sigmoid'
     concat_xy: bool = True
@@ -2425,6 +2559,9 @@ class TransformerCSSM(nn.Module):
         """
         B, T, H, W, C = x.shape
         W_freq = W // 2 + 1
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
 
         if self.rope_mode != 'none':
             x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
@@ -2464,8 +2601,12 @@ class TransformerCSSM(nn.Module):
         U_A_hat = jnp.fft.rfft2(a_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
 
         # === Input-dependent gates (MINIMAL set) ===
-        ctx = x.mean(axis=(2, 3))
-        ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        # Use raw input (before position encoding) for gates if position_independent_gates is True
+        # This makes gates invariant to sequence position, improving length generalization
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))
+        if x_raw is None:  # Only apply temporal RoPE to context if using position-encoded input
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
         n_gate = H * W_freq
 
         # 3 decay gates (bounded 0.1-0.99)

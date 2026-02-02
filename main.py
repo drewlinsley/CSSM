@@ -593,6 +593,8 @@ def main():
                         help='[vit] Block size for LMME channel mixing (1=depthwise, >1=channel mixing). Works with gated and opponent.')
     parser.add_argument('--kernel_size', type=int, default=11,
                         help='[vit] Spatial kernel size for CSSM excitation/inhibition kernels (11=original, 15=larger RF)')
+    parser.add_argument('--position_independent_gates', action='store_true',
+                        help='[cssm] Compute gates from raw input (before position encoding) for better length generalization')
     parser.add_argument('--use_dwconv', action='store_true',
                         help='[vit] Use DWConv in MLP (adds params, matches SHViT)')
     parser.add_argument('--output_act', type=str, default='none',
@@ -620,8 +622,8 @@ def main():
                         choices=['last', 'all'],
                         help='[simple] Use last frame or all frames for readout')
     parser.add_argument('--pos_embed', type=str, default='spatiotemporal',
-                        choices=['spatiotemporal', 'temporal', 'learnable', 'none'],
-                        help='[simple] Position embedding type (RoPE modes applied inside CSSM)')
+                        choices=['spatiotemporal', 'spatial_only', 'separate', 'sinusoidal', 'temporal', 'learnable', 'none'],
+                        help='[simple] Position embedding type: spatiotemporal (VideoRoPE), spatial_only (no temporal), separate (spatial RoPE + learned temporal), sinusoidal (spatial RoPE + sinusoidal temporal, best length extrapolation), temporal, learnable, or none')
     parser.add_argument('--act_type', type=str, default='softplus',
                         choices=['softplus', 'gelu', 'relu'],
                         help='[simple] Nonlinearity type in stem and readout')
@@ -640,7 +642,13 @@ def main():
     parser.add_argument('--prefetch_batches', type=int, default=2,
                         help='Number of batches to prefetch')
     parser.add_argument('--seq_len', type=int, default=8,
-                        help='Sequence length (number of frames)')
+                        help='Sequence length (number of frames). Used as max when --variable_seq_len is set.')
+    parser.add_argument('--variable_seq_len', action='store_true',
+                        help='Enable variable-length training: randomly sample seq_len from [seq_len_min, seq_len] each batch')
+    parser.add_argument('--seq_len_min', type=int, default=4,
+                        help='Minimum sequence length when --variable_seq_len is enabled')
+    parser.add_argument('--max_seq_len', type=int, default=32,
+                        help='[simple] Maximum sequence length for learned temporal embeddings (used with pos_embed=separate)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -808,6 +816,8 @@ def main():
             act_type=args.act_type,
             pool_type=args.pool_type,
             seq_len=args.seq_len,
+            max_seq_len=args.max_seq_len,
+            position_independent_gates=args.position_independent_gates,
         )
     elif args.arch == 'vit':
         model = CSSMViT(
@@ -1056,6 +1066,14 @@ def main():
                 # Skip incomplete batches for multi-GPU
                 if use_multi_gpu and videos.shape[0] % num_devices != 0:
                     continue
+
+                # Variable sequence length training: randomly sample seq_len per batch
+                if args.variable_seq_len:
+                    rng, seq_rng = jax.random.split(rng)
+                    # Sample seq_len uniformly from [seq_len_min, seq_len]
+                    current_seq_len = int(jax.random.randint(seq_rng, (), args.seq_len_min, args.seq_len + 1))
+                    # Slice videos to the sampled length (videos shape: B, T, H, W, C)
+                    videos = videos[:, :current_seq_len]
 
                 # Time the training step
                 step_start = time.perf_counter()

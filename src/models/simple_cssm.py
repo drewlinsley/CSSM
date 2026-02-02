@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, apply_rope
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
 
 
 # Registry of CSSM variants
@@ -38,10 +38,18 @@ class SimpleCSSM(nn.Module):
         kernel_size: CSSM spatial kernel size
         frame_readout: 'last' (single frame) or 'all' (spatiotemporal pool)
         norm_type: 'layer' or 'batch'
-        pos_embed: Position embedding type
+        pos_embed: Position embedding type:
+            - 'spatiotemporal': Combined H, W, T RoPE (VideoRoPE style)
+            - 'spatial_only': Only H, W RoPE, no temporal (better length generalization)
+            - 'separate': Spatial RoPE + learned temporal
+            - 'sinusoidal': Spatial RoPE + sinusoidal temporal (natural length extrapolation)
+            - 'temporal': Only T RoPE
+            - 'learnable': 2D learnable spatial embeddings
+            - 'none': No position encoding
         act_type: Nonlinearity type (softplus, gelu, relu)
         pool_type: Final pooling type (mean, max)
         seq_len: Number of temporal recurrence steps
+        max_seq_len: Maximum sequence length for learned temporal embeddings (used with 'separate')
     """
     num_classes: int = 2
     embed_dim: int = 32
@@ -51,10 +59,12 @@ class SimpleCSSM(nn.Module):
     block_size: int = 1          # Channel mixing block size (1=depthwise, >1=block mixing)
     frame_readout: str = 'last'  # 'last' or 'all'
     norm_type: str = 'layer'     # 'layer' or 'batch'
-    pos_embed: str = 'spatiotemporal'  # 'spatiotemporal', 'temporal', 'learnable', 'none'
+    pos_embed: str = 'spatiotemporal'  # 'spatiotemporal', 'spatial_only', 'separate', 'sinusoidal', 'temporal', 'learnable', 'none'
     act_type: str = 'softplus'   # 'softplus', 'gelu', 'relu'
     pool_type: str = 'mean'      # 'mean' or 'max'
     seq_len: int = 8             # Temporal sequence length
+    max_seq_len: int = 32        # Max sequence length for learned temporal embeddings (used with 'separate')
+    position_independent_gates: bool = False  # Compute gates from raw input (before pos encoding) for length generalization
 
     def _get_act(self):
         """Get activation function."""
@@ -111,26 +121,49 @@ class SimpleCSSM(nn.Module):
         _, H_new, W_new, _ = x.shape
         x = x.reshape(B, T, H_new, W_new, self.embed_dim)
 
-        # === POSITION EMBEDDINGS (learnable 2D spatial, if enabled) ===
+        # === POSITION EMBEDDINGS ===
         if self.pos_embed == 'learnable':
+            # Learnable 2D spatial embeddings (added, not rotated)
             pos = self.param('pos_embed', nn.initializers.normal(0.02),
                            (1, 1, H_new, W_new, self.embed_dim))
             x = x + pos
-        # Note: RoPE ('spatiotemporal', 'temporal') is applied INSIDE CSSM via rope_mode
+        elif self.pos_embed == 'separate':
+            # Separate spatial RoPE + learned temporal
+            # 1. Apply spatial-only RoPE
+            x = apply_rope(x, mode='spatial_only')
+            # 2. Apply learned temporal embedding (with interpolation support)
+            temporal_embed = self.param('temporal_embed', nn.initializers.normal(0.02),
+                                       (self.max_seq_len, self.embed_dim))
+            x = apply_learned_temporal_encoding(x, temporal_embed)
+        elif self.pos_embed == 'sinusoidal':
+            # Separate spatial RoPE + sinusoidal temporal (no learned params)
+            # 1. Apply spatial-only RoPE
+            x = apply_rope(x, mode='spatial_only')
+            # 2. Apply sinusoidal temporal encoding (naturally extrapolates to longer sequences)
+            x = apply_sinusoidal_temporal_encoding(x)
+        # Note: 'spatiotemporal', 'spatial_only', 'temporal' are applied INSIDE CSSM via rope_mode
 
         # === CSSM BLOCK(S) ===
         # Determine rope_mode to pass to CSSM
-        rope_mode = self.pos_embed if self.pos_embed in ['spatiotemporal', 'temporal'] else 'none'
+        # For 'separate' mode, spatial RoPE is already applied above, so pass 'none' to CSSM
+        if self.pos_embed in ['spatiotemporal', 'spatial_only', 'temporal']:
+            rope_mode = self.pos_embed
+        else:
+            rope_mode = 'none'
 
         CSSMClass = CSSM_REGISTRY.get(self.cssm_type, HGRUBilinearCSSM)
         for i in range(self.depth):
-            cssm = CSSMClass(
+            # Build kwargs for CSSM - position_independent_gates only applies to TransformerCSSM
+            cssm_kwargs = dict(
                 channels=self.embed_dim,
                 kernel_size=self.kernel_size,
                 block_size=self.block_size,
                 rope_mode=rope_mode,  # Spatiotemporal RoPE inside CSSM
                 name=f'cssm_{i}'
             )
+            if self.cssm_type == 'transformer' and self.position_independent_gates:
+                cssm_kwargs['position_independent_gates'] = True
+            cssm = CSSMClass(**cssm_kwargs)
             x = x + cssm(x)  # Residual connection
 
         # === READOUT ===
