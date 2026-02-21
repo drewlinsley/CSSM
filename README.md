@@ -29,12 +29,12 @@ pip install -r requirements.txt
 ### Pathfinder (Contour Integration)
 
 ```bash
-python main.py --arch simple --cssm hgru_bi --dataset pathfinder \
-    --pathfinder_difficulty 14 \
-    --tfrecord_dir /path/to/pathfinder_tfrecords/difficulty_14 \
-    --batch_size 256 --seq_len 8 --depth 1 --embed_dim 32 \
-    --kernel_size 11 --lr 3e-4 --epochs 60 \
-    --pos_embed spatiotemporal --bf16
+python main.py --arch simple --cssm add_kqv --dataset pathfinder \
+    --pathfinder_difficulty 14 --tfrecord_dir /path/to/pathfinder_tfrecords_128 \
+    --gate_type factored --embed_dim 32 --seq_len 8 --batch_size 256 --lr 3e-4 \
+    --epochs 60 --use_complex32 --stem_layers 1 --pos_embed spatiotemporal \
+    --kernel_size 11 --image_size 128 --stem_norm_order post --norm_type batch \
+    --pool_type max --no_wandb
 ```
 
 ### ImageNet
@@ -59,9 +59,11 @@ python main.py --arch vit --cssm hgru_bi --dataset imagenet \
 
 | CSSM Type | Flag | Description |
 |-----------|------|-------------|
-| HGRUBilinearCSSM | `--cssm hgru_bi` | 3x3 with X, Y, Z states (recommended) |
-| KQVCSSM | `--cssm kqv` | Transformer-inspired K*Q gating |
+| AdditiveCSSM | `--cssm add_kqv` | 3-state Q->K->V triangular scan (recommended) |
+| HGRUBilinearCSSM | `--cssm hgru_bi` | 3x3 with X, Y, Z states |
 | GatedCSSM | `--cssm gated` | Mamba-style scalar recurrence |
+| TransformerCSSM | `--cssm transformer` or `--cssm kqv` | Q/K/A attention-like dynamics |
+| MultiplicativeTransformerCSSM | `--cssm mult_transformer` | Multiplicative Q/K/A in log-space |
 
 See [docs/models.md](docs/models.md) for detailed descriptions.
 
@@ -100,7 +102,8 @@ CSSM/
     ├── pathfinder.md           # Pathfinder training guide
     ├── cabc.md                 # cABC training guide
     ├── imagenet.md             # ImageNet training guide
-    └── multigpu.md             # Multi-GPU setup
+    ├── multigpu.md             # Multi-GPU setup
+    └── architecture.md         # Architecture deep dive
 ```
 
 ## Multi-GPU Training

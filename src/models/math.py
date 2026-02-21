@@ -10,6 +10,7 @@ Supports three modes:
 3. Block-diagonal (dense mixing): LMME channel mixing - O(C × block_size²) complexity
 """
 
+import jax
 import jax.numpy as jnp
 from typing import Tuple
 
@@ -738,3 +739,488 @@ def make_kqv_block_scan_op(block_size: int):
     def scan_op(carry_i, carry_j):
         return cssm_kqv_block_scan_op(carry_i, carry_j, block_size)
     return scan_op
+
+
+# =============================================================================
+# Linear-split scan operators ("complex32": bfloat16 real + bfloat16 imag)
+# =============================================================================
+#
+# Works in LINEAR complex space (not GOOM log-space). The scan operator is
+# just complex multiply + add — no trig, no log, no exp, no GOOM.
+#
+# Representation: split complex64 into (re_bf16, im_bf16).
+#   re = x.real.astype(bfloat16)
+#   im = x.imag.astype(bfloat16)
+#
+# Complex multiply: (a_re + i*a_im) * (b_re + i*b_im)
+#   = (a_re*b_re - a_im*b_im) + i*(a_re*b_im + a_im*b_re)
+#
+# Complex add: trivial component-wise addition.
+#
+# All intermediate computation promotes to float32 for numerical stability.
+# Only the stored scan state uses bfloat16.
+
+def complex64_to_linear_split(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Convert complex64 to (re_bf16, im_bf16) in linear space."""
+    return x.real.astype(jnp.bfloat16), x.imag.astype(jnp.bfloat16)
+
+
+def linear_split_to_complex64(re: jnp.ndarray, im: jnp.ndarray) -> jnp.ndarray:
+    """Convert (re, im) back to complex64."""
+    return (re.astype(jnp.float32) + 1j * im.astype(jnp.float32)).astype(jnp.complex64)
+
+
+def _ls_complex_mul(a_re, a_im, b_re, b_im):
+    """Complex multiply with float32 promotion, returns bf16."""
+    ar = a_re.astype(jnp.float32)
+    ai = a_im.astype(jnp.float32)
+    br = b_re.astype(jnp.float32)
+    bi = b_im.astype(jnp.float32)
+    out_re = ar * br - ai * bi
+    out_im = ar * bi + ai * br
+    return out_re.astype(jnp.bfloat16), out_im.astype(jnp.bfloat16)
+
+
+def _ls_complex_add(a_re, a_im, b_re, b_im):
+    """Complex add, stays in bf16."""
+    return (a_re + b_re), (a_im + b_im)
+
+
+# --- Scalar (add_kqv_1) ---
+
+def linear_split_scalar_scan_op(carry_i, carry_j):
+    """Scalar associative scan op in linear-split representation.
+
+    Carry = (k_re, k_im, u_re, u_im).
+    Scan recurrence: k_new = k_j * k_i, u_new = k_j * u_i + u_j
+    Just complex multiply + add — no trig, no log/exp.
+    """
+    k_re_i, k_im_i, u_re_i, u_im_i = carry_i
+    k_re_j, k_im_j, u_re_j, u_im_j = carry_j
+
+    # k_new = k_j * k_i (complex multiply)
+    k_re_new, k_im_new = _ls_complex_mul(k_re_j, k_im_j, k_re_i, k_im_i)
+
+    # k_j * u_i
+    ku_re, ku_im = _ls_complex_mul(k_re_j, k_im_j, u_re_i, u_im_i)
+
+    # u_new = k_j * u_i + u_j
+    u_re_new, u_im_new = _ls_complex_add(ku_re, ku_im, u_re_j, u_im_j)
+
+    return k_re_new, k_im_new, u_re_new, u_im_new
+
+
+# --- 2x2 matrix (add_kqv_2) ---
+
+def _ls_matmul_2x2(A_re, A_im, B_re, B_im):
+    """2x2 complex matrix multiply in linear-split representation."""
+    rows_re, rows_im = [], []
+    for i in range(2):
+        cols_re, cols_im = [], []
+        for j in range(2):
+            # C[i,j] = sum_k A[i,k] * B[k,j]
+            # k=0
+            p0_re, p0_im = _ls_complex_mul(
+                A_re[..., i, 0], A_im[..., i, 0],
+                B_re[..., 0, j], B_im[..., 0, j])
+            # k=1
+            p1_re, p1_im = _ls_complex_mul(
+                A_re[..., i, 1], A_im[..., i, 1],
+                B_re[..., 1, j], B_im[..., 1, j])
+            # sum
+            c_re, c_im = _ls_complex_add(p0_re, p0_im, p1_re, p1_im)
+            cols_re.append(c_re)
+            cols_im.append(c_im)
+        rows_re.append(jnp.stack(cols_re, axis=-1))
+        rows_im.append(jnp.stack(cols_im, axis=-1))
+    return jnp.stack(rows_re, axis=-2), jnp.stack(rows_im, axis=-2)
+
+
+def _ls_matvec_2x2(A_re, A_im, v_re, v_im):
+    """2x2 complex matrix-vector multiply in linear-split representation."""
+    ys_re, ys_im = [], []
+    for i in range(2):
+        # y[i] = sum_k A[i,k] * v[k]
+        p0_re, p0_im = _ls_complex_mul(
+            A_re[..., i, 0], A_im[..., i, 0],
+            v_re[..., 0], v_im[..., 0])
+        p1_re, p1_im = _ls_complex_mul(
+            A_re[..., i, 1], A_im[..., i, 1],
+            v_re[..., 1], v_im[..., 1])
+        c_re, c_im = _ls_complex_add(p0_re, p0_im, p1_re, p1_im)
+        ys_re.append(c_re)
+        ys_im.append(c_im)
+    return jnp.stack(ys_re, axis=-1), jnp.stack(ys_im, axis=-1)
+
+
+def linear_split_2x2_scan_op(carry_i, carry_j):
+    """2x2 matrix associative scan op in linear-split representation.
+
+    Carry = (K_re, K_im, U_re, U_im).
+    K: (..., 2, 2), U: (..., 2).
+    Scan: K_new = K_j @ K_i, U_new = K_j @ U_i + U_j
+    """
+    K_re_i, K_im_i, U_re_i, U_im_i = carry_i
+    K_re_j, K_im_j, U_re_j, U_im_j = carry_j
+
+    # K_new = K_j @ K_i
+    K_re_new, K_im_new = _ls_matmul_2x2(K_re_j, K_im_j, K_re_i, K_im_i)
+
+    # K_j @ U_i
+    Ku_re, Ku_im = _ls_matvec_2x2(K_re_j, K_im_j, U_re_i, U_im_i)
+
+    # U_new = K_j @ U_i + U_j
+    U_re_new, U_im_new = _ls_complex_add(Ku_re, Ku_im, U_re_j, U_im_j)
+
+    return K_re_new, K_im_new, U_re_new, U_im_new
+
+
+# --- 3x3 matrix (add_kqv) ---
+
+def _ls_matmul_3x3(A_re, A_im, B_re, B_im):
+    """3x3 complex matrix multiply in linear-split representation."""
+    rows_re, rows_im = [], []
+    for i in range(3):
+        cols_re, cols_im = [], []
+        for j in range(3):
+            # C[i,j] = sum_k A[i,k] * B[k,j]
+            p0_re, p0_im = _ls_complex_mul(
+                A_re[..., i, 0], A_im[..., i, 0],
+                B_re[..., 0, j], B_im[..., 0, j])
+            p1_re, p1_im = _ls_complex_mul(
+                A_re[..., i, 1], A_im[..., i, 1],
+                B_re[..., 1, j], B_im[..., 1, j])
+            acc_re, acc_im = _ls_complex_add(p0_re, p0_im, p1_re, p1_im)
+            p2_re, p2_im = _ls_complex_mul(
+                A_re[..., i, 2], A_im[..., i, 2],
+                B_re[..., 2, j], B_im[..., 2, j])
+            acc_re, acc_im = _ls_complex_add(acc_re, acc_im, p2_re, p2_im)
+            cols_re.append(acc_re)
+            cols_im.append(acc_im)
+        rows_re.append(jnp.stack(cols_re, axis=-1))
+        rows_im.append(jnp.stack(cols_im, axis=-1))
+    return jnp.stack(rows_re, axis=-2), jnp.stack(rows_im, axis=-2)
+
+
+def _ls_matvec_3x3(A_re, A_im, v_re, v_im):
+    """3x3 complex matrix-vector multiply in linear-split representation."""
+    ys_re, ys_im = [], []
+    for i in range(3):
+        p0_re, p0_im = _ls_complex_mul(
+            A_re[..., i, 0], A_im[..., i, 0],
+            v_re[..., 0], v_im[..., 0])
+        p1_re, p1_im = _ls_complex_mul(
+            A_re[..., i, 1], A_im[..., i, 1],
+            v_re[..., 1], v_im[..., 1])
+        acc_re, acc_im = _ls_complex_add(p0_re, p0_im, p1_re, p1_im)
+        p2_re, p2_im = _ls_complex_mul(
+            A_re[..., i, 2], A_im[..., i, 2],
+            v_re[..., 2], v_im[..., 2])
+        acc_re, acc_im = _ls_complex_add(acc_re, acc_im, p2_re, p2_im)
+        ys_re.append(acc_re)
+        ys_im.append(acc_im)
+    return jnp.stack(ys_re, axis=-1), jnp.stack(ys_im, axis=-1)
+
+
+def linear_split_3x3_scan_op(carry_i, carry_j):
+    """3x3 matrix associative scan op in linear-split representation.
+
+    Carry = (K_re, K_im, U_re, U_im).
+    K: (..., 3, 3), U: (..., 3).
+    Scan: K_new = K_j @ K_i, U_new = K_j @ U_i + U_j
+    """
+    K_re_i, K_im_i, U_re_i, U_im_i = carry_i
+    K_re_j, K_im_j, U_re_j, U_im_j = carry_j
+
+    # K_new = K_j @ K_i
+    K_re_new, K_im_new = _ls_matmul_3x3(K_re_j, K_im_j, K_re_i, K_im_i)
+
+    # K_j @ U_i
+    Ku_re, Ku_im = _ls_matvec_3x3(K_re_j, K_im_j, U_re_i, U_im_i)
+
+    # U_new = K_j @ U_i + U_j
+    U_re_new, U_im_new = _ls_complex_add(Ku_re, Ku_im, U_re_j, U_im_j)
+
+    return K_re_new, K_im_new, U_re_new, U_im_new
+
+
+# =============================================================================
+# SSD (State Space Duality) chunked scan — Mamba-2 algorithm for scalar SSMs
+# =============================================================================
+#
+# Ported from Mamba-2 (arXiv 2405.21060, Listing 1) to JAX.
+# Simplified for B=C=1 (scalar SSM per spatial position).
+#
+# Key idea: instead of scanning over T timesteps element-wise (memory-bound),
+# split into chunks of size L, compute intra-chunk via batched matmul
+# (tensor-core friendly), and scan over only T/L chunk boundaries.
+#
+# Works in linear complex space (same as linear_split operators above).
+
+def _ssd_scalar_scan_op(carry_i, carry_j):
+    """Scalar associative scan op for inter-chunk SSD propagation.
+
+    Same recurrence as linear_split_scalar_scan_op but operates on
+    complex64 directly (used for the tiny T/L inter-chunk scan).
+    """
+    a_i, x_i = carry_i
+    a_j, x_j = carry_j
+    return a_j * a_i, a_j * x_i + x_j
+
+
+def ssd_scan(A, X, chunk_size=8, initial_state=None):
+    """SSD chunked scan for scalar SSM: h_t = A_t * h_{t-1} + X_t
+
+    Ported from Mamba-2 Listing 1 with B=C=identity (d_state=1).
+    Works with complex A, X for Fourier-domain CSSM.
+
+    Args:
+        A: (B, T, ...) scalar decay in LINEAR space (complex64)
+        X: (B, T, ...) input in LINEAR space (complex64)
+        chunk_size: chunk size L (default 8). T must be divisible by L.
+        initial_state: optional (B, 1, ...) initial state (complex64)
+
+    Returns:
+        Y: (B, T, ...) accumulated states at all timesteps (complex64)
+    """
+    B_dim, T = A.shape[0], A.shape[1]
+    spatial = A.shape[2:]
+    L = chunk_size
+    assert T % L == 0, f"T={T} must be divisible by chunk_size={L}"
+    n_chunks = T // L
+
+    # Reshape into chunks: (B, T, ...) → (B, n_chunks, L, ...)
+    A = A.reshape(B_dim, n_chunks, L, *spatial)
+    X = X.reshape(B_dim, n_chunks, L, *spatial)
+
+    # --- Step 1: Intra-chunk via causal matmul ---
+    # Cumulative product of A within each chunk (in log-space for numerical stability)
+    log_A = jnp.log(A + 0j)  # ensure complex
+    log_A_cumsum = jnp.cumsum(log_A, axis=2)  # (B, n_chunks, L, ...)
+
+    # Build L×L lower-triangular decay matrix per spatial position
+    # M[i,j] = prod(A[j+1..i]) = exp(cumsum[i] - cumsum[j]) for i >= j
+    # We use einsum-friendly indexing: move L to last dims
+    # log_A_cumsum shape: (B, n_chunks, L, *spatial)
+    # We need: (B, n_chunks, L_i, L_j, *spatial)
+    log_A_i = log_A_cumsum[:, :, :, None]  # (..., L, 1, *spatial) — but spatial is after
+    log_A_j = log_A_cumsum[:, :, None, :]  # (..., 1, L, *spatial)
+
+    # For arbitrary spatial dims, we need to insert the new axis in the right place
+    # log_A_cumsum: (B, nc, L, s0, s1, ...)
+    # We want: diff[b,c,i,j,s0,s1,...] = cumsum[b,c,i,s0,...] - cumsum[b,c,j,s0,...]
+    n_spatial = len(spatial)
+    # Expand dims for broadcasting: i-axis at position 2, j-axis at position 3
+    expand_i = log_A_cumsum[:, :, :, None]  # (B, nc, L, 1, *spatial)
+    expand_j = log_A_cumsum[:, :, None, :]  # (B, nc, 1, L, *spatial)
+    log_decay = expand_i - expand_j  # (B, nc, L, L, *spatial)
+
+    # Causal mask: only i >= j
+    mask = jnp.tril(jnp.ones((L, L), dtype=bool))
+    # Broadcast mask to match: (L, L) → (1, 1, L, L, 1, 1, ...)
+    mask_shape = (1, 1, L, L) + (1,) * n_spatial
+    mask = mask.reshape(mask_shape)
+
+    # Build causal decay matrix M
+    M = jnp.where(mask, jnp.exp(log_decay), jnp.zeros_like(log_decay))
+    # M: (B, nc, L, L, *spatial)
+
+    # Intra-chunk output: Y_diag[b,c,i,...] = sum_j M[b,c,i,j,...] * X[b,c,j,...]
+    # X: (B, nc, L, *spatial) — we need X at the j-axis
+    X_expand = X[:, :, None, :]  # (B, nc, 1, L, *spatial)
+    Y_diag = jnp.sum(M * X_expand, axis=3)  # sum over j → (B, nc, L, *spatial)
+
+    # --- Step 2: Chunk boundary states ---
+    # How much each position decays to the end of its chunk
+    # decay_to_end[j] = exp(cumsum[L-1] - cumsum[j])
+    last_cumsum = log_A_cumsum[:, :, -1:]  # (B, nc, 1, *spatial)
+    decay_to_end = jnp.exp(last_cumsum - log_A_cumsum)  # (B, nc, L, *spatial)
+    # State at chunk boundary = sum of decayed inputs
+    chunk_states = jnp.sum(decay_to_end * X, axis=2)  # (B, nc, *spatial)
+    # Total decay across each chunk
+    chunk_decay = jnp.exp(log_A_cumsum[:, :, -1])  # (B, nc, *spatial)
+
+    # --- Step 3: Inter-chunk scan (tiny: only n_chunks elements) ---
+    if initial_state is not None:
+        # Prepend initial state as chunk 0
+        chunk_states = jnp.concatenate([initial_state, chunk_states], axis=1)
+        # Prepend identity decay for initial state
+        ones_decay = jnp.ones_like(chunk_decay[:, :1])
+        chunk_decay = jnp.concatenate([ones_decay, chunk_decay], axis=1)
+
+        _, propagated = jax.lax.associative_scan(
+            _ssd_scalar_scan_op, (chunk_decay, chunk_states), axis=1
+        )
+        # propagated: (B, n_chunks+1, *spatial)
+        # We want the state ENTERING each chunk (i.e., output of previous chunk)
+        # propagated[0] = initial_state, propagated[1] = state after chunk 0, etc.
+        boundary_states = propagated[:, :-1]  # (B, nc, *spatial) — state entering each chunk
+    else:
+        # No initial state — state entering chunk 0 is zero, so we shift
+        _, propagated = jax.lax.associative_scan(
+            _ssd_scalar_scan_op, (chunk_decay, chunk_states), axis=1
+        )
+        # propagated[c] = accumulated state at END of chunk c
+        # State entering chunk c = propagated[c-1], with zeros for chunk 0
+        zeros = jnp.zeros_like(propagated[:, :1])
+        boundary_states = jnp.concatenate([zeros, propagated[:, :-1]], axis=1)
+        # boundary_states: (B, nc, *spatial)
+
+    # --- Step 4: Correct intra-chunk outputs with boundary states ---
+    # decay_from_start[i] = exp(cumsum[i]) = cumulative decay from chunk start to position i
+    # But we need cumsum starting from 0 (position before first element of chunk)
+    # cumsum[i] = sum(log_A[0..i]), so exp(cumsum[0]) = A[0], exp(cumsum[i]) = prod(A[0..i])
+    # We want: decay from "entering state" to position i = prod(A[0..i]) = exp(cumsum[i])
+    # But actually log_A_cumsum[0] = log_A[0], so exp gives A[0]. We need to include
+    # the first element too. exp(cumsum) is correct: state * A[0] * A[1] * ... * A[i].
+    decay_from_start = jnp.exp(log_A_cumsum)  # (B, nc, L, *spatial)
+    # Broadcast boundary state into chunk positions
+    Y_off = boundary_states[:, :, None] * decay_from_start  # (B, nc, L, *spatial)
+
+    Y = (Y_diag + Y_off).reshape(B_dim, T, *spatial)
+    return Y
+
+
+# =============================================================================
+# Legacy phase-split scan operators (DEPRECATED — kept for benchmark comparison)
+# =============================================================================
+# These use (mag_bf16, phase_bf16) in GOOM log-space, requiring expensive
+# trig (cos/sin/atan2) in _ps_log_add_exp. The linear-split operators above
+# are much faster because they use only multiply + add.
+
+def complex64_to_phase_split(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Convert GOOM complex64 to (mag_bf16, phase_bf16). DEPRECATED."""
+    return x.real.astype(jnp.bfloat16), x.imag.astype(jnp.bfloat16)
+
+
+def phase_split_to_complex64(mag: jnp.ndarray, phase: jnp.ndarray) -> jnp.ndarray:
+    """Convert (mag, phase) back to GOOM complex64. DEPRECATED."""
+    return (mag.astype(jnp.float32) + 1j * phase.astype(jnp.float32)).astype(jnp.complex64)
+
+
+def _ps_log_add_exp(
+    mag_a: jnp.ndarray, phase_a: jnp.ndarray,
+    mag_b: jnp.ndarray, phase_b: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """log(exp(a) + exp(b)) in phase-split representation. DEPRECATED."""
+    out_dtype = mag_a.dtype
+    ma = mag_a.astype(jnp.float32)
+    mb = mag_b.astype(jnp.float32)
+    pa = phase_a.astype(jnp.float32)
+    pb = phase_b.astype(jnp.float32)
+
+    c = jax.lax.stop_gradient(jnp.maximum(ma, mb))
+    ea = jnp.exp(ma - c)
+    eb = jnp.exp(mb - c)
+
+    re = ea * jnp.cos(pa) + eb * jnp.cos(pb)
+    im = ea * jnp.sin(pa) + eb * jnp.sin(pb)
+
+    new_mag = c + 0.5 * jnp.log(jnp.maximum(re * re + im * im, 1e-30))
+    new_phase = jnp.arctan2(im, re)
+
+    return new_mag.astype(out_dtype), new_phase.astype(out_dtype)
+
+
+def phase_split_scalar_scan_op(carry_i, carry_j):
+    """Scalar scan op in phase-split GOOM. DEPRECATED — use linear_split_scalar_scan_op."""
+    k_mag_i, k_phase_i, u_mag_i, u_phase_i = carry_i
+    k_mag_j, k_phase_j, u_mag_j, u_phase_j = carry_j
+    k_mag_new = k_mag_j + k_mag_i
+    k_phase_new = k_phase_j + k_phase_i
+    ku_mag = k_mag_j + u_mag_i
+    ku_phase = k_phase_j + u_phase_i
+    u_mag_new, u_phase_new = _ps_log_add_exp(ku_mag, ku_phase, u_mag_j, u_phase_j)
+    return k_mag_new, k_phase_new, u_mag_new, u_phase_new
+
+
+def phase_split_2x2_scan_op(carry_i, carry_j):
+    """2x2 scan op in phase-split GOOM. DEPRECATED — use linear_split_2x2_scan_op."""
+    K_mag_i, K_phase_i, U_mag_i, U_phase_i = carry_i
+    K_mag_j, K_phase_j, U_mag_j, U_phase_j = carry_j
+
+    def _ps_matmul_2x2(Am, Ap, Bm, Bp):
+        rows_m, rows_p = [], []
+        for i in range(2):
+            cols_m, cols_p = [], []
+            for j in range(2):
+                m0 = Am[..., i, 0] + Bm[..., 0, j]
+                p0 = Ap[..., i, 0] + Bp[..., 0, j]
+                m1 = Am[..., i, 1] + Bm[..., 1, j]
+                p1 = Ap[..., i, 1] + Bp[..., 1, j]
+                cm, cp = _ps_log_add_exp(m0, p0, m1, p1)
+                cols_m.append(cm)
+                cols_p.append(cp)
+            rows_m.append(jnp.stack(cols_m, axis=-1))
+            rows_p.append(jnp.stack(cols_p, axis=-1))
+        return jnp.stack(rows_m, axis=-2), jnp.stack(rows_p, axis=-2)
+
+    def _ps_matvec_2x2(Am, Ap, vm, vp):
+        ys_m, ys_p = [], []
+        for i in range(2):
+            m0 = Am[..., i, 0] + vm[..., 0]
+            p0 = Ap[..., i, 0] + vp[..., 0]
+            m1 = Am[..., i, 1] + vm[..., 1]
+            p1 = Ap[..., i, 1] + vp[..., 1]
+            cm, cp = _ps_log_add_exp(m0, p0, m1, p1)
+            ys_m.append(cm)
+            ys_p.append(cp)
+        return jnp.stack(ys_m, axis=-1), jnp.stack(ys_p, axis=-1)
+
+    K_mag_new, K_phase_new = _ps_matmul_2x2(K_mag_j, K_phase_j, K_mag_i, K_phase_i)
+    Ku_mag, Ku_phase = _ps_matvec_2x2(K_mag_j, K_phase_j, U_mag_i, U_phase_i)
+    u_mag_list, u_phase_list = [], []
+    for k in range(2):
+        m, p = _ps_log_add_exp(Ku_mag[..., k], Ku_phase[..., k], U_mag_j[..., k], U_phase_j[..., k])
+        u_mag_list.append(m)
+        u_phase_list.append(p)
+    return (K_mag_new, K_phase_new, jnp.stack(u_mag_list, axis=-1), jnp.stack(u_phase_list, axis=-1))
+
+
+def phase_split_3x3_scan_op(carry_i, carry_j):
+    """3x3 scan op in phase-split GOOM. DEPRECATED — use linear_split_3x3_scan_op."""
+    K_mag_i, K_phase_i, U_mag_i, U_phase_i = carry_i
+    K_mag_j, K_phase_j, U_mag_j, U_phase_j = carry_j
+
+    def _ps_matmul_3x3(Am, Ap, Bm, Bp):
+        rows_m, rows_p = [], []
+        for i in range(3):
+            cols_m, cols_p = [], []
+            for j in range(3):
+                m0 = Am[..., i, 0] + Bm[..., 0, j]
+                p0 = Ap[..., i, 0] + Bp[..., 0, j]
+                m1 = Am[..., i, 1] + Bm[..., 1, j]
+                p1 = Ap[..., i, 1] + Bp[..., 1, j]
+                acc_m, acc_p = _ps_log_add_exp(m0, p0, m1, p1)
+                m2 = Am[..., i, 2] + Bm[..., 2, j]
+                p2 = Ap[..., i, 2] + Bp[..., 2, j]
+                acc_m, acc_p = _ps_log_add_exp(acc_m, acc_p, m2, p2)
+                cols_m.append(acc_m)
+                cols_p.append(acc_p)
+            rows_m.append(jnp.stack(cols_m, axis=-1))
+            rows_p.append(jnp.stack(cols_p, axis=-1))
+        return jnp.stack(rows_m, axis=-2), jnp.stack(rows_p, axis=-2)
+
+    def _ps_matvec_3x3(Am, Ap, vm, vp):
+        ys_m, ys_p = [], []
+        for i in range(3):
+            m0 = Am[..., i, 0] + vm[..., 0]
+            p0 = Ap[..., i, 0] + vp[..., 0]
+            m1 = Am[..., i, 1] + vm[..., 1]
+            p1 = Ap[..., i, 1] + vp[..., 1]
+            acc_m, acc_p = _ps_log_add_exp(m0, p0, m1, p1)
+            m2 = Am[..., i, 2] + vm[..., 2]
+            p2 = Ap[..., i, 2] + vp[..., 2]
+            acc_m, acc_p = _ps_log_add_exp(acc_m, acc_p, m2, p2)
+            ys_m.append(acc_m)
+            ys_p.append(acc_p)
+        return jnp.stack(ys_m, axis=-1), jnp.stack(ys_p, axis=-1)
+
+    K_mag_new, K_phase_new = _ps_matmul_3x3(K_mag_j, K_phase_j, K_mag_i, K_phase_i)
+    Ku_mag, Ku_phase = _ps_matvec_3x3(K_mag_j, K_phase_j, U_mag_i, U_phase_i)
+    u_mag_list, u_phase_list = [], []
+    for k in range(3):
+        m, p = _ps_log_add_exp(Ku_mag[..., k], Ku_phase[..., k], U_mag_j[..., k], U_phase_j[..., k])
+        u_mag_list.append(m)
+        u_phase_list.append(p)
+    return (K_mag_new, K_phase_new, jnp.stack(u_mag_list, axis=-1), jnp.stack(u_phase_list, axis=-1))

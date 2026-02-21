@@ -1,107 +1,134 @@
 # Multi-GPU Training Guide
 
-CSSM supports multi-GPU training via JAX's `pmap` for data parallelism.
+This guide covers multi-GPU setup and troubleshooting for CSSM training.
 
 ## Automatic Detection
 
-Multi-GPU training is enabled automatically when multiple GPUs are visible:
+Multi-GPU training is automatic when multiple GPUs are detected:
 
 ```bash
-# Uses all visible GPUs
-python main.py --arch vit --cssm hgru_bi ...
-
-# Specify which GPUs to use
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py ...
+python main.py --dataset pathfinder ...
+# Output: "Devices: 4 (['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3'])"
+# Output: "Multi-GPU training enabled: batch_size=256, per_device=64"
 ```
 
-## How It Works
+## NCCL Testing
 
-1. **Data parallelism**: Batch is split across GPUs
-2. **Gradient synchronization**: `pmean` averages gradients across devices
-3. **State replication**: Model parameters are replicated to all devices
+Before training, the system tests NCCL collective operations:
 
-## Batch Size
+```
+Testing NCCL collective operations...
+NCCL test PASSED: pmean result shape=(4, 10), value=1.0000
+```
 
-The effective batch size is `batch_size * num_gpus`:
+If this fails:
+- NCCL library may be misconfigured
+- GPUs may not support direct communication
+
+## Forcing Multi-GPU
+
+If NCCL test fails but you want to proceed:
 
 ```bash
-# With 4 GPUs and batch_size=64, effective batch = 256
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --batch_size 64 ...
+--force_multi_gpu
 ```
 
-## Complex Gradient Handling
+This bypasses the test (use at your own risk).
 
-CSSM uses FFT which produces complex-valued tensors. Since NCCL doesn't support complex types directly, gradients are converted to real representation for synchronization:
+## Batch Size Handling
 
+- Batch size is **total** batch size
+- Automatically split across GPUs
+- Adjusted if not evenly divisible
+
+Example with 4 GPUs:
+```bash
+--batch_size 256  # 64 per GPU
+```
+
+## Common Issues
+
+### 1. NCCL Timeout
+
+**Symptom:** Training hangs during first batch
+
+**Solutions:**
+- Set environment variable: `export NCCL_P2P_DISABLE=1`
+- Try: `export NCCL_IB_DISABLE=1`
+- Reduce batch size
+
+### 2. OOM on Some GPUs
+
+**Symptom:** CUDA OOM error on GPU 1+ but not GPU 0
+
+**Solutions:**
+- Reduce batch size
+- Check no other processes using GPUs: `nvidia-smi`
+
+### 3. TensorFlow GPU Conflict
+
+**Symptom:** JAX NCCL fails when TF also tries to use GPU
+
+**Note:** The code already handles this by setting:
 ```python
-# Handled automatically by pmean_complex_safe()
-# Complex (a + bi) -> Real [a, b] -> pmean -> Complex (a + bi)
+tf.config.set_visible_devices([], 'GPU')
 ```
 
-## Troubleshooting
+### 4. Slow Training
 
-### "NCCL error"
+**Symptom:** Multi-GPU slower than expected
 
-Complex gradients require special handling. This should be automatic, but if you see NCCL errors:
+**Check:**
+- GPU utilization: `nvidia-smi dmon -s u`
+- Should see >90% utilization on all GPUs
+- If not, data loading may be bottleneck
 
-1. Ensure you're using the latest code with `pmean_complex_safe()`
-2. Try reducing batch size
-3. Check CUDA/NCCL versions match
+**Solutions:**
+- Increase `--num_workers`
+- Increase `--prefetch_batches`
+- Use TFRecord data loading
 
-### Uneven GPU utilization
+## Checkpointing with Multi-GPU
 
-All GPUs should show similar utilization. If not:
+State is replicated across GPUs. When saving:
+- Only first GPU's copy is saved
+- Use `--checkpointer simple` for NFS filesystems
+
+## Environment Variables
+
+Useful NCCL environment variables:
 
 ```bash
-# Check GPU status
-nvidia-smi -l 1
+# Disable peer-to-peer (if communication issues)
+export NCCL_P2P_DISABLE=1
 
-# Ensure batch_size is divisible by num_gpus
-# batch_size=64 with 4 GPUs = 16 per GPU
+# Disable InfiniBand (if IB issues)
+export NCCL_IB_DISABLE=1
+
+# Debug NCCL issues
+export NCCL_DEBUG=INFO
+
+# Set specific GPU order
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 ```
 
-### Out of Memory
+## Verifying Multi-GPU
 
-With multi-GPU, each GPU holds a copy of the model:
+Check that all GPUs are being used:
 
+1. **During training:** Watch `nvidia-smi` - all GPUs should show activity
+2. **In logs:** "Multi-GPU training enabled" message
+3. **Timing:** Multi-GPU should be faster than single GPU
+
+## Single-GPU Fallback
+
+If multi-GPU fails, training automatically falls back to single GPU:
+
+```
+Multi-GPU may not work. Falling back to single GPU...
+```
+
+To explicitly use single GPU:
 ```bash
-# Reduce per-GPU batch size
---batch_size 32  # instead of 64
-
-# Enable bf16 to reduce memory
---bf16
+export CUDA_VISIBLE_DEVICES=0
 ```
-
-### Slow multi-GPU
-
-1. **NVLink**: GPUs connected via NVLink are faster than PCIe
-2. **Checkpointing**: Use local storage, not NFS:
-   ```bash
-   --checkpoint_dir /local/scratch/checkpoints
-   ```
-
-## Verification
-
-Check that multi-GPU is working:
-
-```python
-import jax
-print(f"Devices: {jax.devices()}")
-print(f"Num devices: {len(jax.devices())}")
-```
-
-During training, you should see:
-```
-Running on 4 devices (multi-GPU enabled)
-```
-
-## Single vs Multi-GPU Performance
-
-| GPUs | Batch | Effective Batch | Relative Speed |
-|------|-------|-----------------|----------------|
-| 1 | 64 | 64 | 1x |
-| 2 | 64 | 128 | ~1.9x |
-| 4 | 64 | 256 | ~3.7x |
-| 8 | 64 | 512 | ~7.2x |
-
-Scaling efficiency is typically 90-95% with NVLink.

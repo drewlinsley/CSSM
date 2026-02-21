@@ -1,109 +1,157 @@
 # CSSM Model Variants
 
-This document describes the available CSSM (Cepstral State Space Model) variants.
+This document describes the available CSSM (Cepstral State Space Model) variants and their characteristics.
 
 ## Overview
 
-All CSSM variants share a common design:
-- **FFT-based spatial processing**: O(N log N) spatial mixing via spectral convolution
-- **Temporal recurrence**: Associative scan for O(log T) parallel temporal processing
-- **GOOM numerics**: Log-space computation for numerical stability
+CSSM models process video sequences using state space dynamics in the spectral (frequency) domain. They replace attention mechanisms with recurrent dynamics that operate on spatial frequency representations.
 
 ## Available Variants
 
-### HGRUBilinearCSSM (`--cssm hgru_bi`) - **Recommended**
+### HGRUBilinearCSSM (Primary)
 
-The primary CSSM variant, inspired by hGRU (horizontal Gated Recurrent Unit).
+**CLI flag:** `--cssm hgru_bi`
 
-**State dimensions**: 3x3 (X, Y, Z)
-- X = Excitatory state (receives input, inhibited by Y and Z)
-- Y = Inhibitory state (excited by X and Z)
-- Z = Interaction channel (learns to track X-Y correlation)
+The primary CSSM variant, inspired by the hGRU (horizontal Gated Recurrent Unit) from neuroscience.
 
-**Dynamics**:
+**Key Features:**
+- 3-state system: X (excitatory), Y (inhibitory), Z (interaction channel)
+- Separate excitation and inhibition kernels (K_E and K_I)
+- Z channel learns to approximate bilinear X*Y dynamics
+- Maintains associativity for O(log T) parallel scan
+
+**Dynamics:**
 ```
 X_t = decay_x·X - μ_I·K_I·Y - α_I·K_I·Z + U_X
 Y_t = μ_E·K_E·X + decay_y·Y + α_E·K_E·Z + U_Y
 Z_t = γ·X + δ·Y + ε·Z + U_Z
 ```
 
-**Key features**:
-- Excitation/inhibition dynamics with spatial kernels K_E, K_I
-- Z channel approximates bilinear X*Y interaction while maintaining associativity
-- Input-dependent gates for all coupling strengths
+**Best For:** Most tasks, especially those requiring lateral interactions (Pathfinder, cABC).
 
-**Additional options**:
-- `--readout_state`: Which state(s) to use for output (`xyz`, `x`, `y`, `z`, `xy`, `xz`, `yz`)
-- `--pre_output_act`: Activation before output projection (`none`, `gelu`, `silu`)
+---
 
-### KQVCoupledCSSM (`--cssm kqv_coupled`) - **Improved KQV**
+### GatedCSSM
 
-Enhanced KQV variant with cross-state coupling and recurrent gating.
-
-**State dimensions**: 3x3 (K, Q, V) with full coupling
-
-**Transition matrix**:
-```
-[decay_K·K_K    0            β_K·K_V ]   K ← V feedback
-[0             decay_Q·K_Q   β_Q·K_V ]   Q ← V feedback
-[γ_K·K_K       γ_Q·K_Q      decay_V·K_V]   V ← K,Q recurrent gating
-```
-
-**Key improvements over KQVCSSM**:
-1. **Cross-state coupling (V→K, V→Q)**: β gates let V influence K and Q evolution
-2. **Recurrent gating (K→V, Q→V)**: γ gates make V's transition depend on K,Q histories
-3. **Rich output**: Uses all three states [K, Q, V] concatenated (like HGRUBilinearCSSM)
-
-**Why this works better**: The γ terms create "recurrent gating" where V's state evolution
-depends on K and Q through the transition matrix, not just input gating. This is analogous
-to how Z in HGRUBilinearCSSM tracks X-Y interaction.
-
-**Additional options**:
-- `--readout_state`: Which state(s) for output (`kqv`, `k`, `q`, `v`, `kv`, `qv`)
-- `--pre_output_act`: Activation before output projection (`none`, `gelu`, `silu`)
-
-### KQVCSSM (`--cssm kqv`)
-
-Original KQV variant with block-diagonal transitions and K*Q input gating only.
-
-**State dimensions**: 3x3 (K, Q, V) - block diagonal (no cross-state coupling)
-- K = Key state (evolves independently)
-- Q = Query state (evolves independently)
-- V = Value state (receives input gated by K*Q)
-
-**Limitation**: K and Q evolve blindly - they don't receive feedback from V, so they
-can't adapt to what V needs. Only V is used for output. Consider using `kqv_coupled` instead.
-
-### GatedCSSM (`--cssm gated`)
+**CLI flag:** `--cssm gated`
 
 Mamba-style gated CSSM with input-dependent integration.
 
-**State dimensions**: Scalar per channel
-- Simple h_t = A_bar * h_{t-1} + B_bar * u_t recurrence
-- Input-dependent decay (Δ gate)
-- Input/output gating (B, C gates)
+**Key Features:**
+- Full Mamba formulation in log-spectral domain
+- Input-dependent decay (A_bar), input projection (B_bar), and output projection (C)
+- Supports both depthwise and dense (LMME) channel mixing
 
-**When to use**: Simpler baseline, fewer parameters, good for ablation studies.
+**Dynamics:**
+```
+h_t = A_bar * h_{t-1} + B_bar * u_t
+y_t = C * h_t
+```
 
-## Channel Mixing Modes
+**Best For:** Simpler tasks, faster training, fewer parameters.
 
-All variants support:
-- `--mixing depthwise` (default): Each channel independent
-- `--mixing dense`: Channels can mix within blocks (LMME)
-- `--block_size N`: Block size for channel mixing (1=depthwise, >1=block mixing)
+---
 
-## Hyperparameter Recommendations
+### TransformerCSSM
 
-| Task | CSSM | kernel_size | embed_dim | depth | seq_len |
-|------|------|-------------|-----------|-------|---------|
-| Pathfinder | hgru_bi | 11 | 32 | 1 | 8 |
-| cABC | hgru_bi | 11 | 32 | 1 | 8 |
-| ImageNet | hgru_bi | 11 | 384 | 12 | 8 |
+**CLI flag:** `--cssm transformer` or `--cssm kqv`
 
-## Architecture Selection
+Minimal transformer-inspired CSSM with Q, K, A states.
 
-| Architecture | Use Case |
-|-------------|----------|
-| `--arch simple` | Pathfinder, cABC (minimal, fast) |
-| `--arch vit` | ImageNet (full CSSM-ViT) |
-| `--arch baseline` | ViT with attention (comparison) |
+**Key Features:**
+- Q (Query), K (Key), A (Attention/Accumulator) state channels
+- Additive dynamics using GOOM (Generalized Order of Magnitude)
+- A accumulates Q-K correlation over time (iteratively growing attention)
+- Single spatial kernel (simplified from E/I)
+
+**Dynamics:**
+```
+Q_t = decay_Q·Q + w·K·K + α·K·A + U_Q
+K_t = w·K·Q + decay_K·K + U_K
+A_t = γ·Q + γ·K + decay_A·A + U_A
+```
+
+**Best For:** Tasks benefiting from attention-like dynamics, interpretability studies.
+
+---
+
+### MultiplicativeTransformerCSSM
+
+**CLI flag:** `--cssm mult_transformer`
+
+Multiplicative Q/K/A dynamics in log-spectral space.
+
+**Key Features:**
+- Purely multiplicative dynamics become LINEAR in log space
+- No GOOM/LSE complexity - uses regular matrix multiplication
+- LayerNorm in log-space prevents overflow
+
+**Log-space Dynamics:**
+```
+q_t = u_Q + k_s + a_qq·q_{t-1} + a_qk·k_{t-1} + a_qa·a_{t-1}
+k_t = u_K + k_s + a_kq·q_{t-1} + a_kk·k_{t-1}
+a_t = u_A + γ·q_{t-1} + γ·k_{t-1} + a_aa·a_{t-1}
+```
+
+**Options:**
+- `--no_goom`: Disable GOOM (assumes positive inputs, faster but less flexible)
+
+**Best For:** Experimental, when multiplicative dynamics are desired.
+
+---
+
+## Ablation Variants (Testing Only)
+
+These variants exist for ablation studies and are not recommended for production use:
+
+### LinearCSSM
+Vanilla spectral convolution without log-space. Uses sequential O(T) scan instead of parallel O(log T).
+
+### LinearOpponentCSSM
+2x2 opponent dynamics without log-space. Sequential scan.
+
+---
+
+## Architecture Options
+
+### SimpleCSSM Architecture
+The SimpleCSSM architecture (`--arch simple`) is recommended for smaller tasks:
+
+```
+Conv -> act -> norm -> maxpool
+Conv -> act -> norm -> maxpool
++ Position Embeddings
+CSSM block(s)
+Frame selection -> Norm -> act -> pool -> head
+```
+
+### CSSM-ViT Architecture
+The CSSM-ViT architecture (`--arch vit`) is for larger-scale training:
+
+- Patch or conv stem
+- Pre-norm transformer-style blocks
+- CSSM replaces attention
+- Global pooling + classifier head
+
+---
+
+## Common Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--kernel_size` | Spatial kernel size for E/I convolutions | 11 |
+| `--block_size` | Channel mixing block size (1=depthwise) | 1 |
+| `--readout_state` | Which state(s) to use for output | 'xyz' |
+| `--pre_output_act` | Activation before output projection | 'none' |
+
+---
+
+## Choosing a Variant
+
+| Task | Recommended | Reason |
+|------|-------------|--------|
+| Pathfinder | `hgru_bi` | Lateral E/I interactions critical |
+| cABC | `hgru_bi` | Contour integration benefits from E/I |
+| ImageNet | `hgru_bi` or `gated` | Both work well |
+| Fast training | `gated` | Fewer parameters |
+| Interpretability | `transformer` | Explicit Q/K/A |

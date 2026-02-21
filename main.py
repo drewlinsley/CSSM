@@ -17,15 +17,19 @@ Training features:
 # IMPORTANT: Configure TensorFlow to use CPU-only BEFORE importing it
 # This prevents TensorFlow (used for TFRecord data loading) from conflicting
 # with JAX's NCCL for multi-GPU training.
+# On Blackwell (compute capability 10.0), TF's C++ runtime tries to JIT-compile
+# kernels from PTX on import, which takes 30+ minutes. Hiding GPUs via
+# TF_VISIBLE_DEVICES prevents this probe entirely.
 # =============================================================================
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF info/warning logs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress ALL TF C++ logs
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Don't preallocate if TF does use GPU
 # =============================================================================
 
 import argparse
 import pickle
 import re
+import sys
 import time
 from functools import partial
 from typing import Any, Dict, Tuple
@@ -140,20 +144,34 @@ from src.models.simple_cssm import SimpleCSSM
 from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
 
 # =============================================================================
-# Configure TensorFlow to use CPU only BEFORE importing data loaders
-# This prevents TensorFlow from conflicting with JAX's NCCL for multi-GPU
+# Configure TensorFlow to use CPU only BEFORE importing data loaders.
+# On Blackwell GPUs (compute capability 10.0), TF's C++ runtime tries to
+# JIT-compile CUDA kernels from PTX on import (~30 min). We hide GPUs via
+# CUDA_VISIBLE_DEVICES BEFORE importing TF (and before JAX creates a CUDA
+# context) so TF never sees the GPUs. Then we restore CUDA_VISIBLE_DEVICES
+# before JAX initializes.
 # =============================================================================
+_saved_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Hide GPUs from TF
 try:
     import tensorflow as tf
-    # Hide all GPUs from TensorFlow - it only needs CPU for data loading
     tf.config.set_visible_devices([], 'GPU')
 except ImportError:
     pass  # TensorFlow not installed
 except RuntimeError:
-    pass  # Virtual devices already initialized
+    pass  # Devices already initialized
+finally:
+    # Restore CUDA_VISIBLE_DEVICES so JAX can see GPUs when it initializes
+    if _saved_cuda_visible is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = _saved_cuda_visible
+    else:
+        del os.environ['CUDA_VISIBLE_DEVICES']
+# Now force JAX to initialize its CUDA backend (with correct GPU visibility)
+_ = jax.devices()
 
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 from src.cabc_data import get_cabc_loader, get_cabc_info, get_cabc_tfrecord_loader
+from src.pathtracker_data import get_pathtracker_loader, get_pathtracker_info, get_pathtracker_tfrecord_loader
 
 
 # Multi-GPU utilities
@@ -204,6 +222,7 @@ def create_train_state(
     total_steps: int,
     warmup_steps: int = 500,
     grad_clip: float = 1.0,
+    image_size: int = 224,
 ) -> Tuple[TrainState, optax.GradientTransformation]:
     """
     Initialize training state with optimizer and LR schedule.
@@ -216,22 +235,24 @@ def create_train_state(
         total_steps: Total training steps for LR schedule
         warmup_steps: Number of warmup steps
         grad_clip: Maximum gradient norm
+        image_size: Input image spatial size
 
     Returns:
         Tuple of (train_state, optimizer)
     """
     # Create dummy input for initialization
-    dummy_input = jnp.ones((1, 8, 224, 224, 3))
+    dummy_input = jnp.ones((1, 8, image_size, image_size, 3))
     variables = model.init({'params': rng, 'dropout': rng}, dummy_input, training=False)
     params = variables['params']
     batch_stats = variables.get('batch_stats', None)  # For BatchNorm
 
     # Learning rate schedule: warmup + cosine decay
+    # decay_steps = total schedule length (warmup + cosine decay)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=learning_rate,
         warmup_steps=warmup_steps,
-        decay_steps=total_steps - warmup_steps,
+        decay_steps=total_steps,
         end_value=learning_rate * 0.01,
     )
 
@@ -253,7 +274,7 @@ def create_train_state(
         batch_stats=batch_stats,
     )
 
-    return state, tx
+    return state, tx, schedule
 
 
 @partial(jax.jit, static_argnums=(3, 4))
@@ -389,20 +410,21 @@ def evaluate(
     """
     total_loss = 0.0
     total_acc = 0.0
-    count = 0
+    total_samples = 0
 
     for i, batch in enumerate(val_loader):
         if num_batches is not None and i >= num_batches:
             break
 
         metrics = eval_step(state, batch, num_classes, has_batch_stats)
-        total_loss += float(metrics['val_loss'])
-        total_acc += float(metrics['val_acc'])
-        count += 1
+        batch_size = batch[0].shape[0]
+        total_loss += float(metrics['val_loss']) * batch_size
+        total_acc += float(metrics['val_acc']) * batch_size
+        total_samples += batch_size
 
     return {
-        'val_loss': total_loss / max(count, 1),
-        'val_acc': total_acc / max(count, 1),
+        'val_loss': total_loss / max(total_samples, 1),
+        'val_acc': total_acc / max(total_samples, 1),
     }
 
 
@@ -510,7 +532,7 @@ def evaluate_multi_gpu(
     """Run multi-GPU validation evaluation."""
     total_loss = 0.0
     total_acc = 0.0
-    count = 0
+    total_samples = 0
 
     for i, batch in enumerate(val_loader):
         if num_batches is not None and i >= num_batches:
@@ -522,21 +544,23 @@ def evaluate_multi_gpu(
         if videos.shape[0] % num_devices != 0:
             continue
 
+        batch_size = videos.shape[0]
+
         # Reshape for pmap: (B, ...) -> (num_devices, B//num_devices, ...)
-        batch_per_device = videos.shape[0] // num_devices
+        batch_per_device = batch_size // num_devices
         videos = videos.reshape(num_devices, batch_per_device, *videos.shape[1:])
         labels = labels.reshape(num_devices, batch_per_device, *labels.shape[1:])
 
         metrics = eval_step_fn(state, (videos, labels))
 
         # Get scalar from first device (all devices have same value after pmean)
-        total_loss += float(metrics['val_loss'][0])
-        total_acc += float(metrics['val_acc'][0])
-        count += 1
+        total_loss += float(metrics['val_loss'][0]) * batch_size
+        total_acc += float(metrics['val_acc'][0]) * batch_size
+        total_samples += batch_size
 
     return {
-        'val_loss': total_loss / max(count, 1),
-        'val_acc': total_acc / max(count, 1),
+        'val_loss': total_loss / max(total_samples, 1),
+        'val_acc': total_acc / max(total_samples, 1),
     }
 
 
@@ -551,9 +575,9 @@ def main():
 
     # CSSM configuration
     parser.add_argument('--cssm', type=str,
-                        choices=['hgru_bi', 'transformer', 'gated', 'kqv', 'standard', 'opponent', 'hgru', 'bilinear'],
+                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1'],
                         default='hgru_bi',
-                        help='CSSM type: hgru_bi, kqv (K*Q gating), transformer, gated, standard, opponent, hgru, bilinear')
+                        help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan)')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
                         help='Mixing type: dense (multi-head) or depthwise')
     parser.add_argument('--no_concat_xy', action='store_true',
@@ -570,14 +594,14 @@ def main():
     parser.add_argument('--patch_size', type=int, default=16,
                         help='[vit/baseline] Patch size (only used with --stem_mode patch)')
     parser.add_argument('--stem_mode', type=str, default='conv',
-                        choices=['patch', 'conv'],
-                        help='[vit] Stem: patch (ViT-style) or conv (single conv + GELU + norm)')
+                        choices=['patch', 'conv', 'default', 'pathtracker'],
+                        help='[vit] patch/conv; [simple] default (conv+norm+act+pool per layer) or pathtracker (1x1 conv, no downsample)')
+    parser.add_argument('--stem_layers', type=int, default=2,
+                        help='[simple] Number of stem layers (each = conv+norm+act+pool = 2x downsample)')
     parser.add_argument('--stem_stride', type=int, default=4,
                         choices=[1, 2, 3, 4],
                         help='[vit] Stem downsampling stride (only for single-conv stem)')
-    parser.add_argument('--stem_norm', type=str, default='layer',
-                        choices=['layer', 'batch'],
-                        help='[vit] Stem normalization: layer (LayerNorm) or batch (BatchNorm)')
+    # Note: --stem_norm is defined below in SimpleCSSM section (shared with ViT)
     parser.add_argument('--no_pos_embed', action='store_true',
                         help='[vit/baseline] Disable position embeddings')
     parser.add_argument('--num_heads', type=int, default=6,
@@ -596,7 +620,47 @@ def main():
     parser.add_argument('--position_independent_gates', action='store_true',
                         help='[cssm] Compute gates from raw input (before position encoding) for better length generalization')
     parser.add_argument('--no_goom', action='store_true',
-                        help='[cssm] Disable GOOM (log-space) scan; use linear-space instead (may have numerical issues)')
+                        help='[mult_transformer] Disable GOOM (complex log) - assumes positive inputs, faster but less flexible')
+    parser.add_argument('--gate_type', type=str, default='dense',
+                        choices=['dense', 'channel', 'scalar', 'conv', 'dense_decay', 'dense_io',
+                                 'factored', 'spectral_conv', 'low_rank'],
+                        help='[add_kqv] Gate type: dense (all per-freq), channel (1x1 conv), scalar, conv (5x5 conv), dense_decay (per-freq decay + channel I/O), dense_io (channel decay + per-freq I/O), factored (separable H×W_freq), spectral_conv (5x5 conv on spectral magnitude), low_rank (bottleneck rank-8)')
+    parser.add_argument('--n_register_tokens', type=int, default=0,
+                        help='[simple] Number of learnable register tokens prepended to temporal sequence (0=disabled)')
+    parser.add_argument('--learned_init', action='store_true',
+                        help='[add_kqv] Learn initial state for CSSM recurrence instead of starting from zero')
+    parser.add_argument('--use_complex32', action='store_true',
+                        help='[add_kqv] Phase-split scan: bf16 mag + bf16 phase (halves scan memory, faster compile)')
+    parser.add_argument('--use_ssd', action='store_true',
+                        help='[add_kqv] Use SSD chunked scan (Mamba-2 algorithm) instead of associative scan')
+    parser.add_argument('--ssd_chunk_size', type=int, default=8,
+                        help='[add_kqv] Chunk size for SSD scan (default: 8)')
+    # Ablation flags for g_transformer and mg_transformer
+    parser.add_argument('--shared_kernel', action='store_true',
+                        help='[g_transformer/mg_transformer] Use 1 shared kernel for Q/K/V instead of separate kernels')
+    parser.add_argument('--additive_kv', action='store_true',
+                        help='[g_transformer/mg_transformer] Use additive Q→V + K→V instead of multiplicative Q·K→V')
+    parser.add_argument('--spectral_clip', action='store_true',
+                        help='[g_transformer/mg_transformer] Apply spectral magnitude clipping (rho=0.999) to kernels')
+    # mg_transformer 3D conv config
+    parser.add_argument('--q_temporal', type=int, default=3,
+                        help='[mg_transformer] Temporal extent of Q conv (default: 3)')
+    parser.add_argument('--q_spatial', type=int, default=5,
+                        help='[mg_transformer] Spatial extent of Q conv (default: 5)')
+    # Ablation flags for transformer (TransformerCSSM)
+    parser.add_argument('--asymmetric_qk', action='store_true',
+                        help='[transformer] Use separate weights for Q→K and K→Q (breaks symmetry)')
+    parser.add_argument('--no_feedback', action='store_true',
+                        help='[transformer] Remove A→Q feedback loop')
+    parser.add_argument('--no_spectral_clip', action='store_true',
+                        help='[transformer] Skip spectral magnitude clipping on kernel')
+    parser.add_argument('--use_layernorm', action='store_true',
+                        help='[transformer] Add log-space LayerNorm before output (like g_transformer)')
+    parser.add_argument('--no_k_state', action='store_true',
+                        help='[transformer] Drop K state entirely, use lean 2x2 Q+A scan')
+    parser.add_argument('--transformer_readout', type=str, default='qka',
+                        choices=['qka', 'q', 'k', 'a', 'qk', 'qa', 'ka'],
+                        help='[transformer] Which states to read out: qka (all), a (like V in others), etc.')
     parser.add_argument('--use_dwconv', action='store_true',
                         help='[vit] Use DWConv in MLP (adds params, matches SHViT)')
     parser.add_argument('--output_act', type=str, default='none',
@@ -633,8 +697,20 @@ def main():
                         choices=['mean', 'max'],
                         help='[simple] Final spatial/spatiotemporal pooling type')
     parser.add_argument('--norm_type', type=str, default='layer',
-                        choices=['layer', 'batch'],
-                        help='[simple] Normalization type throughout model')
+                        choices=['layer', 'batch', 'instance'],
+                        help='[simple] Default normalization type (overridden by --stem_norm/--body_norm)')
+    parser.add_argument('--stem_norm', type=str, default='',
+                        choices=['', 'layer', 'batch', 'instance'],
+                        help='[simple] Stem norm type (default: use --norm_type)')
+    parser.add_argument('--body_norm', type=str, default='',
+                        choices=['', 'layer', 'batch', 'instance'],
+                        help='[simple] Body/readout norm type, also used between CSSM blocks (default: use --norm_type)')
+    parser.add_argument('--readout_norm', type=str, default='pre',
+                        choices=['pre', 'post'],
+                        help='[simple] Readout norm order: pre (norm→act→pool) or post (act→norm→pool)')
+    parser.add_argument('--stem_norm_order', type=str, default='post',
+                        choices=['pre', 'post'],
+                        help='[simple] Stem norm order: pre (norm→act→conv) or post (conv→act→norm)')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -690,14 +766,17 @@ def main():
                         help='Checkpointer: simple (pickle, NFS-safe), pytree (orbax), standard (orbax async)')
 
     # Data
-    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'cabc', 'imagenet'], default='imagenette',
-                        help='Dataset: imagenette, pathfinder, cabc, or imagenet')
+    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'cabc', 'imagenet', 'pathtracker'], default='imagenette',
+                        help='Dataset: imagenette, pathfinder, cabc, imagenet, or pathtracker')
     parser.add_argument('--data_dir', type=str,
                         default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
                         help='Path to dataset directory')
     parser.add_argument('--imagenet_dir', type=str,
                         default='/gpfs/data/shared/imagenet/ILSVRC2012',
                         help='Path to ImageNet directory')
+    parser.add_argument('--pathtracker_dir', type=str,
+                        default='/media/data_cifs/projects/prj_video_datasets/pathtracker',
+                        help='Path to PathTracker dataset directory')
     parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20'], default='9',
                         help='[pathfinder] Contour length difficulty (9=easy, 20=hard)')
     parser.add_argument('--cabc_difficulty', type=str, choices=['easy', 'medium', 'hard'], default='easy',
@@ -720,6 +799,15 @@ def main():
                         help='Disable wandb logging')
 
     args = parser.parse_args()
+
+    # Override ViT defaults when using simple architecture
+    # (ViT defaults: depth=12, embed_dim=384 are inappropriate for SimpleCSSM)
+    if args.arch == 'simple':
+        # Only override if user didn't explicitly set these
+        if '--depth' not in sys.argv:
+            args.depth = 1
+        if '--embed_dim' not in sys.argv:
+            args.embed_dim = 32
 
     # Setup JAX optimizations (must be before any JAX operations)
     setup_jax_optimizations(
@@ -746,6 +834,8 @@ def main():
             run_name = f"pf{args.pathfinder_difficulty}_{run_name}"
         elif args.dataset == 'cabc':
             run_name = f"cabc{args.cabc_difficulty}_{run_name}"
+        elif args.dataset == 'pathtracker':
+            run_name = f"pt_{run_name}"
     print(f"\n{'='*60}")
     print(f"Running Configuration: {run_name}")
     print(f"Architecture: {args.arch.upper()}")
@@ -784,6 +874,13 @@ def main():
             tfrecord_dir=args.tfrecord_dir,
         )
         dataset_name = f"cABC (difficulty={args.cabc_difficulty})"
+    elif args.dataset == 'pathtracker':
+        dataset_info = get_pathtracker_info(root=args.pathtracker_dir)
+        dataset_name = "PathTracker"
+        # PathTracker: auto-set seq_len and image_size from video
+        args.seq_len = dataset_info['num_frames']
+        args.image_size = dataset_info['image_size']
+        print(f"  PathTracker: {args.seq_len} frames, {args.image_size}x{args.image_size} (auto-set)")
     elif args.dataset == 'imagenet':
         dataset_info = get_imagenet_info()
         dataset_name = "ImageNet"
@@ -797,7 +894,14 @@ def main():
     total_steps = steps_per_epoch * args.epochs
 
     print(f"Dataset: {dataset_name}")
-    print(f"  Data dir: {args.data_dir}")
+    if args.tfrecord_dir and args.dataset in ('pathfinder', 'cabc', 'pathtracker'):
+        print(f"  Data dir: {args.tfrecord_dir} (TFRecord)")
+    elif args.dataset == 'pathtracker':
+        print(f"  Data dir: {args.pathtracker_dir}")
+    elif args.dataset == 'imagenet':
+        print(f"  Data dir: {args.imagenet_dir}")
+    else:
+        print(f"  Data dir: {args.data_dir}")
     print(f"  Train samples: {train_size}")
     print(f"  Num classes: {num_classes}")
     print(f"  Steps per epoch: {steps_per_epoch}")
@@ -805,6 +909,8 @@ def main():
 
     # Create model based on architecture
     if args.arch == 'simple':
+        # Map stem_mode for simple arch: ViT values ('conv', 'patch') → 'default'
+        simple_stem_mode = args.stem_mode if args.stem_mode in ('default', 'pathtracker') else 'default'
         model = SimpleCSSM(
             num_classes=num_classes,
             embed_dim=args.embed_dim,
@@ -814,12 +920,38 @@ def main():
             block_size=args.block_size,
             frame_readout=args.frame_readout,
             norm_type=args.norm_type,
+            stem_norm=args.stem_norm,
+            body_norm=args.body_norm,
+            readout_norm=args.readout_norm,
+            stem_norm_order=args.stem_norm_order,
             pos_embed=args.pos_embed,
             act_type=args.act_type,
             pool_type=args.pool_type,
             seq_len=args.seq_len,
             max_seq_len=args.max_seq_len,
             position_independent_gates=args.position_independent_gates,
+            use_goom=not args.no_goom,
+            stem_mode=simple_stem_mode,
+            stem_layers=args.stem_layers,
+            # Ablation flags for g_transformer/mg_transformer
+            shared_kernel=args.shared_kernel,
+            additive_kv=args.additive_kv,
+            spectral_clip=args.spectral_clip,
+            q_temporal=args.q_temporal,
+            q_spatial=args.q_spatial,
+            # Ablation flags for transformer (TransformerCSSM)
+            asymmetric_qk=args.asymmetric_qk,
+            no_feedback=args.no_feedback,
+            no_spectral_clip=args.no_spectral_clip,
+            use_layernorm=args.use_layernorm,
+            no_k_state=args.no_k_state,
+            transformer_readout=args.transformer_readout,
+            gate_type=args.gate_type,
+            n_register_tokens=args.n_register_tokens,
+            learned_init=args.learned_init,
+            use_complex32=args.use_complex32,
+            use_ssd=args.use_ssd,
+            ssd_chunk_size=args.ssd_chunk_size,
         )
     elif args.arch == 'vit':
         model = CSSMViT(
@@ -829,7 +961,7 @@ def main():
             patch_size=args.patch_size,
             stem_mode=args.stem_mode,
             stem_stride=args.stem_stride,
-            stem_norm=args.stem_norm,
+            stem_norm=args.stem_norm if args.stem_norm else 'layer',
             cssm_type=args.cssm,
             dense_mixing=(args.mixing == 'dense'),
             concat_xy=not args.no_concat_xy,
@@ -859,14 +991,21 @@ def main():
             use_pos_embed=not args.no_pos_embed,
         )
 
+    # Calculate warmup steps - ensure there's at least 1 step for cosine decay
+    warmup_steps = min(500, max(0, total_steps - 1))
+    print(f"  Warmup steps: {warmup_steps}")
+    print(f"  Cosine decay steps: {total_steps - warmup_steps}")
+
     # Initialize training state
-    state, _ = create_train_state(
+    state, _, schedule = create_train_state(
         rng=init_rng,
         model=model,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         total_steps=total_steps,
+        warmup_steps=warmup_steps,
         grad_clip=args.grad_clip,
+        image_size=args.image_size,
     )
 
     # Check if model uses BatchNorm (has batch_stats)
@@ -1002,6 +1141,7 @@ def main():
                 root=args.data_dir,
                 difficulty=args.pathfinder_difficulty,
                 batch_size=args.batch_size,
+                image_size=args.image_size,
                 num_frames=args.seq_len,
                 split='train',
                 num_workers=args.num_workers,
@@ -1025,6 +1165,27 @@ def main():
                 batch_size=args.batch_size,
                 num_frames=args.seq_len,
                 split='train',
+                num_workers=args.num_workers,
+                prefetch_batches=args.prefetch_batches,
+            )
+    elif args.dataset == 'pathtracker':
+        if args.tfrecord_dir:
+            train_loader = get_pathtracker_tfrecord_loader(
+                tfrecord_dir=args.tfrecord_dir,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+                shuffle=True,
+                prefetch_batches=args.prefetch_batches,
+            )
+        else:
+            train_loader = get_pathtracker_loader(
+                root=args.pathtracker_dir,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                image_size=args.image_size,
+                split='train',
+                shuffle=True,
                 num_workers=args.num_workers,
                 prefetch_batches=args.prefetch_batches,
             )
@@ -1065,8 +1226,10 @@ def main():
                 rng, step_rng = jax.random.split(rng)
                 videos, labels = batch
 
-                # Skip incomplete batches for multi-GPU
+                # Skip incomplete batches for multi-GPU (batch must divide evenly across devices)
                 if use_multi_gpu and videos.shape[0] % num_devices != 0:
+                    if num_batches == 0:  # Only warn once per epoch
+                        print(f"  Warning: dropping incomplete batch (size {videos.shape[0]}, need multiple of {num_devices})")
                     continue
 
                 # Variable sequence length training: randomly sample seq_len per batch
@@ -1117,8 +1280,8 @@ def main():
 
                 # Log to wandb
                 if not args.no_wandb and global_step % args.log_every == 0:
-                    # Get current learning rate from optimizer state
-                    lr = args.lr  # Simplified - actual LR from schedule
+                    # Get current learning rate from schedule
+                    lr = float(schedule(global_step))
                     wandb.log({
                         'train/loss': loss_val,
                         'train/acc': acc_val,
@@ -1159,6 +1322,7 @@ def main():
                         root=args.data_dir,
                         difficulty=args.pathfinder_difficulty,
                         batch_size=args.batch_size,
+                        image_size=args.image_size,
                         num_frames=args.seq_len,
                         split='val',
                         shuffle=False,
@@ -1184,6 +1348,27 @@ def main():
                         batch_size=args.batch_size,
                         num_frames=args.seq_len,
                         split='test',
+                        shuffle=False,
+                        num_workers=args.num_workers,
+                        prefetch_batches=args.prefetch_batches,
+                    )
+            elif args.dataset == 'pathtracker':
+                if args.tfrecord_dir:
+                    val_loader = get_pathtracker_tfrecord_loader(
+                        tfrecord_dir=args.tfrecord_dir,
+                        batch_size=args.batch_size,
+                        num_frames=args.seq_len,
+                        split='val',
+                        shuffle=False,
+                        prefetch_batches=args.prefetch_batches,
+                    )
+                else:
+                    val_loader = get_pathtracker_loader(
+                        root=args.pathtracker_dir,
+                        batch_size=args.batch_size,
+                        num_frames=args.seq_len,
+                        image_size=args.image_size,
+                        split='val',
                         shuffle=False,
                         num_workers=args.num_workers,
                         prefetch_batches=args.prefetch_batches,

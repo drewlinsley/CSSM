@@ -197,12 +197,15 @@ class PathfinderVideoLoader:
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = True,
+        seed: int = 42,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.n_samples = len(dataset)
+        self._epoch = 0
+        self._seed = seed
 
     def __len__(self):
         if self.drop_last:
@@ -212,7 +215,9 @@ class PathfinderVideoLoader:
     def __iter__(self):
         indices = np.arange(self.n_samples)
         if self.shuffle:
-            np.random.shuffle(indices)
+            rng = np.random.RandomState(self._seed + self._epoch)
+            rng.shuffle(indices)
+            self._epoch += 1
 
         for start_idx in range(0, self.n_samples, self.batch_size):
             batch_indices = indices[start_idx:start_idx + self.batch_size]
@@ -250,6 +255,7 @@ class PathfinderVideoLoaderFast:
         drop_last: bool = True,
         num_workers: int = 4,
         prefetch_batches: int = 2,
+        seed: int = 42,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -258,6 +264,8 @@ class PathfinderVideoLoaderFast:
         self.num_workers = num_workers
         self.prefetch_batches = prefetch_batches
         self.n_samples = len(dataset)
+        self._epoch = 0
+        self._seed = seed
 
     def __len__(self):
         if self.drop_last:
@@ -293,7 +301,9 @@ class PathfinderVideoLoaderFast:
     def __iter__(self):
         indices = np.arange(self.n_samples)
         if self.shuffle:
-            np.random.shuffle(indices)
+            rng = np.random.RandomState(self._seed + self._epoch)
+            rng.shuffle(indices)
+            self._epoch += 1
 
         # Create list of batch indices
         batch_indices_list = []
@@ -464,6 +474,12 @@ def get_pathfinder_info(
 
 try:
     import tensorflow as tf
+    # IMPORTANT: Force TensorFlow to use CPU only to avoid NCCL conflicts with JAX
+    # This must be done before any TF operations
+    try:
+        tf.config.set_visible_devices([], 'GPU')
+    except RuntimeError:
+        pass  # Devices already initialized
     HAS_TF = True
 except ImportError:
     HAS_TF = False

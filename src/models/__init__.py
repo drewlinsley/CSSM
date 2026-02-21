@@ -1,6 +1,6 @@
 """CSSM and ConvNeXt model components."""
 
-from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, AdditiveCSSM
 from .convnext import ConvNextBlock, CSSMNextBlock, HybridBlock, ModelFactory
 from .cssm_vit import CSSMViT, CSSMBlock, cssm_vit_tiny, cssm_vit_small, cssm_vit_base
 from .simple_cssm import SimpleCSSM, CSSM_REGISTRY
@@ -12,8 +12,11 @@ __all__ = [
     # CSSM layers
     "GatedCSSM",
     "HGRUBilinearCSSM",
-    "KQVCSSM",
-    "KQVCoupledCSSM",
+    "TransformerCSSM",
+    "MultiplicativeTransformerCSSM",
+    "GrowingTransformerCSSM",
+    "MambaGrowingTransformerCSSM",
+    "AdditiveCSSM",
     # SimpleCSSM architecture
     "SimpleCSSM",
     "CSSM_REGISTRY",

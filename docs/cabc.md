@@ -1,81 +1,81 @@
-# cABC (Contour ABC) Training Guide
+# cABC Task Training Guide
 
-The cABC task is similar to Pathfinder but uses letter-shaped contours (A, B, C) embedded in clutter.
+The cABC (contour ABC) task tests contour completion with shape discrimination.
 
 ## Dataset
 
-cABC consists of images with:
-- A letter-shaped contour (A, B, or C)
-- Background clutter and distractors
-- Task: classify which letter is present (3-way classification)
+Images contain partially occluded contours. The task is to classify which shape the contour belongs to (A, B, or C - 3-way classification).
 
-**Difficulties**:
-- `easy`: Clear contours, minimal clutter
-- `medium`: Moderate clutter (default)
-- `hard`: Dense clutter, challenging
+**Difficulties:**
+- `easy`: Minimal occlusion
+- `medium`: Moderate occlusion
+- `hard`: Heavy occlusion
 
-## Data Preparation
-
-### Option 1: TFRecords (Recommended)
+## Recommended Configuration
 
 ```bash
-# Convert to TFRecords
-python scripts/convert_cabc_tfrecords.py \
-    --input_dir /path/to/cabc/medium \
-    --output_dir /path/to/cabc_tfrecords/medium
-```
-
-### Option 2: PNG Files
-
-Direct loading from the original dataset directory.
-
-## Training Commands
-
-### Recommended Configuration
-
-```bash
-python main.py --arch simple --cssm hgru_bi --dataset cabc \
+python main.py \
+    --arch simple \
+    --cssm hgru_bi \
+    --dataset cabc \
     --cabc_difficulty medium \
-    --tfrecord_dir /path/to/cabc_tfrecords/medium \
-    --batch_size 256 --seq_len 8 --depth 1 --embed_dim 32 \
-    --kernel_size 11 --lr 3e-4 --epochs 60 \
-    --pos_embed spatiotemporal --bf16
+    --tfrecord_dir /path/to/cabc_tfrecords \
+    --batch_size 256 \
+    --seq_len 8 \
+    --depth 1 \
+    --embed_dim 32 \
+    --kernel_size 11 \
+    --lr 3e-4 \
+    --epochs 60 \
+    --pos_embed spatiotemporal \
+    --bf16
 ```
 
-### Without TFRecords
+## Key Parameters
 
-```bash
-python main.py --arch simple --cssm hgru_bi --dataset cabc \
-    --cabc_difficulty medium \
-    --data_dir /path/to/cabc \
-    --batch_size 256 --seq_len 8 --depth 1 --embed_dim 32 \
-    --kernel_size 11 --lr 3e-4 --epochs 60
-```
-
-## Key Hyperparameters
-
-| Parameter | Recommended | Notes |
-|-----------|-------------|-------|
+| Parameter | Value | Notes |
+|-----------|-------|-------|
 | `--arch` | `simple` | Minimal architecture |
-| `--cssm` | `hgru_bi` | 3x3 opponent dynamics |
-| `--depth` | `1` | Single CSSM block |
-| `--embed_dim` | `32` | Small dimension |
-| `--seq_len` | `8` | Temporal steps |
-| `--kernel_size` | `11` | Spatial kernel |
-| `--batch_size` | `256` | Adjust for GPU memory |
+| `--cssm` | `hgru_bi` | Contour integration requires E/I |
+| `--depth` | 1 | Single CSSM block usually sufficient |
+| `--embed_dim` | 32 | Small for efficiency |
+| `--kernel_size` | 11 | 11-15 works well |
 
-## Expected Results
+## Differences from Pathfinder
+
+- **3-way classification** instead of binary
+- Requires **shape discrimination** not just connectivity
+- May benefit from **more recurrence steps** (`--seq_len 12`)
+
+## Expected Performance
 
 | Difficulty | Expected Accuracy |
 |------------|-------------------|
-| easy | ~95%+ |
-| medium | ~85%+ |
-| hard | ~75%+ |
+| easy | 90%+ |
+| medium | 85%+ |
+| hard | 75%+ |
 
-## Comparison with Pathfinder
+## TFRecord Data
 
-| Aspect | Pathfinder | cABC |
-|--------|------------|------|
-| Classes | 2 (connected/not) | 3 (A/B/C) |
-| Contour shape | Random curves | Letter shapes |
-| Spatial reasoning | Path following | Shape recognition |
+```bash
+--tfrecord_dir /path/to/cabc_tfrecords
+```
+
+Note: cABC uses `test` split for validation (no separate val split).
+
+## Tips
+
+1. **Harder than Pathfinder** - may need longer training
+2. **Consider `--depth 2`** for hard difficulty
+3. **Larger kernel** (`--kernel_size 15`) may help with occluded contours
+
+## Training Progress
+
+Monitor both:
+- Training accuracy (should improve steadily)
+- Validation accuracy (watch for overfitting)
+
+If validation accuracy plateaus while training continues improving, consider:
+- Stronger regularization (`--weight_decay 1e-3`)
+- Earlier stopping
+- Data augmentation (if implemented)

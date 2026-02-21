@@ -12,7 +12,12 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .math import cssm_scalar_scan_op, cssm_matrix_scan_op, make_block_scan_op
+from .math import (cssm_scalar_scan_op, cssm_matrix_scan_op, cssm_3x3_matrix_scan_op,
+                    make_block_scan_op,
+                    complex64_to_linear_split, linear_split_to_complex64,
+                    linear_split_scalar_scan_op, linear_split_2x2_scan_op,
+                    linear_split_3x3_scan_op,
+                    ssd_scan)
 from .goom import to_goom, from_goom
 
 
@@ -34,6 +39,45 @@ def _stable_spectral_magnitude(K: jnp.ndarray, rho: float = 0.999) -> jnp.ndarra
     """
     K_mag = jnp.abs(K)
     return K * rho / (1.0 + K_mag)
+
+
+def log_add_exp(log_a: jnp.ndarray, log_b: jnp.ndarray) -> jnp.ndarray:
+    """
+    Numerically stable log(exp(log_a) + exp(log_b)) for log-space addition.
+
+    Handles both real and complex (GOOM) log-space representations.
+    For complex inputs, operates on the real part for stability while preserving phase.
+
+    Args:
+        log_a: First log-space value (real or complex)
+        log_b: Second log-space value (real or complex)
+
+    Returns:
+        log(exp(log_a) + exp(log_b)) in the same dtype as inputs
+    """
+    is_complex = jnp.iscomplexobj(log_a) or jnp.iscomplexobj(log_b)
+    if is_complex:
+        # For GOOM: real part is log-magnitude, imag is phase
+        # We do logsumexp on magnitudes, then average phases weighted by magnitudes
+        log_mag_a = log_a.real if jnp.iscomplexobj(log_a) else log_a
+        log_mag_b = log_b.real if jnp.iscomplexobj(log_b) else log_b
+        phase_a = log_a.imag if jnp.iscomplexobj(log_a) else jnp.zeros_like(log_a)
+        phase_b = log_b.imag if jnp.iscomplexobj(log_b) else jnp.zeros_like(log_b)
+
+        # logsumexp for magnitudes
+        max_log = jnp.maximum(log_mag_a, log_mag_b)
+        log_sum_mag = max_log + jnp.log(jnp.exp(log_mag_a - max_log) + jnp.exp(log_mag_b - max_log))
+
+        # Weighted average of phases (weights are exp(log_mag))
+        weight_a = jnp.exp(log_mag_a - log_sum_mag)
+        weight_b = jnp.exp(log_mag_b - log_sum_mag)
+        phase_sum = weight_a * phase_a + weight_b * phase_b
+
+        return log_sum_mag + 1j * phase_sum
+    else:
+        # Standard logsumexp for real values
+        max_log = jnp.maximum(log_a, log_b)
+        return max_log + jnp.log(jnp.exp(log_a - max_log) + jnp.exp(log_b - max_log))
 
 
 def apply_rope(x: jnp.ndarray, mode: str = 'spatiotemporal', base: float = 10000.0) -> jnp.ndarray:
@@ -288,134 +332,6 @@ def apply_temporal_rope_to_context(ctx: jnp.ndarray, base: float = 10000.0) -> j
 
     # Add to context (broadcast over batch)
     return ctx + t_embed[None, :, :]
-
-
-class StandardCSSM(nn.Module):
-    """
-    Standard Log-Spectral State Space Model.
-
-    Implements the recurrence: h_t = K * h_{t-1} + u_t
-    in the spectral (frequency) domain using FFT, with computation
-    performed in log-space using GOOM for numerical stability.
-
-    Attributes:
-        channels: Number of input/output channels
-        dense_mixing: If True, use multi-head parameter sharing (more efficient).
-                     If False, use fully independent depthwise kernels.
-        kernel_size: Spatial kernel size (square)
-        spectral_rho: Maximum spectral magnitude for stability (should be < 1)
-        rope_mode: Position encoding mode ('spatiotemporal', 'temporal', 'none')
-        rope_base: Base for RoPE frequency computation
-        concat_xy: Unused (for API compatibility with GatedOpponentCSSM)
-        gate_activation: Unused (for API compatibility with GatedOpponentCSSM)
-        gate_rank: Unused (for API compatibility with GatedOpponentCSSM)
-        block_size: Unused (for API compatibility with GatedOpponentCSSM)
-    """
-    channels: int
-    dense_mixing: bool = False
-    kernel_size: int = 15
-    spectral_rho: float = 0.999
-    rope_mode: str = 'none'  # 'spatiotemporal', 'temporal', or 'none'
-    rope_base: float = 10000.0
-    concat_xy: bool = True  # Unused, for API compatibility
-    gate_activation: str = 'sigmoid'  # Unused, for API compatibility
-    gate_rank: int = 0  # Unused, for API compatibility
-    block_size: int = 1  # Unused, for API compatibility
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass.
-
-        Args:
-            x: Input tensor of shape (B, T, H, W, C)
-               B = batch, T = time, H/W = spatial, C = channels
-
-        Returns:
-            Output tensor of shape (B, T, H, W, C)
-        """
-        B, T, H, W, C = x.shape
-
-        # === Apply RoPE before FFT (VideoRoPE style) ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Kernel Generation ---
-        if self.dense_mixing:
-            # Multi-Head Dense Mixing to save parameters
-            # Head dimension of 32 is a good balance
-            head_dim = 32
-            num_heads = max(1, C // head_dim)
-
-            # Param shape: (num_heads, kernel_size, kernel_size)
-            # Each head's kernel is shared across head_dim channels
-            k_param = self.param(
-                'kernel',
-                nn.initializers.normal(0.02),
-                (num_heads, self.kernel_size, self.kernel_size)
-            )
-
-            # Broadcast heads to match channels
-            # (num_heads, K, K) -> (C, K, K) by repeating each kernel
-            k_spatial = jnp.repeat(k_param, C // num_heads, axis=0)
-        else:
-            # Independent Depthwise: each channel has its own kernel
-            k_spatial = self.param(
-                'kernel',
-                nn.initializers.normal(0.02),
-                (C, self.kernel_size, self.kernel_size)
-            )
-
-        # --- 2. Spectral Transform ---
-        # Pad kernel to image size (handle edge cases)
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        # Ensure symmetric padding to match H, W exactly
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        k_padded = jnp.pad(
-            k_spatial,
-            ((0, 0), (pad_h, max(0, pad_h_after)), (pad_w, max(0, pad_w_after))),
-            mode='constant'
-        )
-
-        # If kernel is larger than image, crop instead
-        if self.kernel_size > H or self.kernel_size > W:
-            start_h = (self.kernel_size - H) // 2
-            start_w = (self.kernel_size - W) // 2
-            k_padded = k_spatial[:, start_h:start_h+H, start_w:start_w+W]
-
-        # RFFT over spatial dims (axes 1, 2 of kernel -> H, W)
-        K_hat_raw = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
-        # Squash spectral magnitude to ensure stability (|K| < 1)
-        K_hat = _stable_spectral_magnitude(K_hat_raw, rho=self.spectral_rho)
-
-        # Reshape input for FFT: (B, T, H, W, C) -> (B, T, C, H, W)
-        x_perm = x.transpose(0, 1, 4, 2, 3)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-
-        # --- 3. Cepstral Scan ---
-        # Convert to GOOM representation (numerically stable log-space)
-        K_log = to_goom(K_hat)  # (C, H, W_freq)
-        # Broadcast to match input shape: (C, H, W_f) -> (B, T, C, H, W_f)
-        K_log = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
-        U_log = to_goom(U_hat)
-
-        # Scan over time dimension (axis 1)
-        _, X_log = jax.lax.associative_scan(
-            cssm_scalar_scan_op, (K_log, U_log), axis=1
-        )
-
-        # --- 4. Inverse Transform ---
-        # Convert back from GOOM representation
-        X_hat = from_goom(X_log)
-        x_out = jnp.fft.irfft2(X_hat, s=(H, W), axes=(3, 4))
-
-        # Back to (B, T, H, W, C)
-        return x_out.transpose(0, 1, 3, 4, 2)
-
-
 class GatedCSSM(nn.Module):
     """
     Mamba-style Gated CSSM with full input-dependent integration.
@@ -858,876 +774,6 @@ class GatedCSSM(nn.Module):
             x_out = x_out[..., :C]
 
         return x_out
-
-
-class GatedOpponentCSSM(nn.Module):
-    """
-    Gated Opponent CSSM with biologically-plausible X<->Y coupled oscillator.
-
-    Implements a 2x2 state transition matrix with Mamba-style input-dependent gates:
-    - Diagonal: decay terms (alpha for X, delta for Y) - per-frequency
-    - Off-diagonal: coupling (mu for inhibition Y->X, gamma for excitation X->Y) - per-frequency
-    - B gate: Input projection (controls how input enters state) - per-frequency
-    - C gate: Output projection (controls how state exits) - per-frequency
-
-    Uses GOOM primitives for numerically stable log-space computation.
-
-    **Channel Mixing Modes (block_size parameter):**
-    - block_size=1 (default): Depthwise - no channel mixing within E or I pools
-    - block_size>1: LMME - channels mix within blocks in both E and I pools
-      This enables cross-channel horizontal connections like hGRU.
-
-    Attributes:
-        channels: Number of input/output channels
-        dense_mixing: If True, use multi-head parameter sharing (legacy, prefer block_size)
-        block_size: Channel mixing block size (1=depthwise, >1=LMME within E/I pools)
-        kernel_size: Spatial kernel size for excitation/inhibition kernels
-        spectral_rho: Maximum spectral magnitude for stability (should be < 1)
-        concat_xy: If True, concat [X,Y] and project to C channels
-        gate_activation: Activation for gates ('sigmoid', 'softplus_clamped', 'tanh_scaled')
-        rope_mode: Position encoding mode ('spatiotemporal', 'temporal', 'none')
-        rope_base: Base for RoPE frequency computation
-    """
-    channels: int
-    dense_mixing: bool = False
-    block_size: int = 1  # 1=depthwise (no channel mixing), >1=LMME channel mixing
-    kernel_size: int = 11
-    spectral_rho: float = 0.999
-    concat_xy: bool = True
-    gate_activation: str = 'sigmoid'
-    gate_rank: int = 0  # If > 0, use low-rank gates: Dense(C -> rank) -> Dense(rank -> n_feats)
-    rope_mode: str = 'none'  # 'spatiotemporal', 'temporal', or 'none'
-    rope_base: float = 10000.0
-
-    def _compute_gate(self, ctx: jnp.ndarray, output_size: int, name: str) -> jnp.ndarray:
-        """Compute gate with optional low-rank bottleneck."""
-        if self.gate_rank > 0:
-            # Low-rank: ctx -> rank -> output_size
-            x = nn.Dense(self.gate_rank, name=f'{name}_down')(ctx)
-            x = nn.gelu(x)
-            return nn.Dense(output_size, name=f'{name}_up')(x)
-        else:
-            # Full rank: ctx -> output_size
-            return nn.Dense(output_size, name=name)(ctx)
-
-    def _apply_gate_activation(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Apply configured activation to gate values."""
-        if self.gate_activation == 'sigmoid':
-            return nn.sigmoid(x)  # [0, 1] - safe default
-        elif self.gate_activation == 'softplus_clamped':
-            return jnp.minimum(nn.softplus(x), 2.0)  # [0, 2] with clamp
-        elif self.gate_activation == 'tanh_scaled':
-            return (jnp.tanh(x) + 1) * 0.5  # [0, 1] centered around 0.5
-        else:
-            return nn.sigmoid(x)  # fallback to safe default
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass with full Mamba-style per-frequency gating.
-
-        Args:
-            x: Input tensor of shape (B, T, H, W, C)
-
-        Returns:
-            Output tensor of shape (B, T, H, W, C)
-        """
-        B, T, H, W, C = x.shape
-        W_freq = W // 2 + 1  # rfft2 output width
-
-        # Route based on block_size
-        if self.block_size > 1:
-            return self._forward_lmme(x, B, T, H, W, C, W_freq)
-
-        # === Apply RoPE before FFT (VideoRoPE style) ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Spatial Kernels ---
-        k_shape = (C, self.kernel_size, self.kernel_size)
-        k_exc = self.param('k_exc', nn.initializers.normal(0.02), k_shape)
-        k_inh = self.param('k_inh', nn.initializers.normal(0.02), k_shape)
-
-        # Pad and FFT kernels
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        def pad_kernel(k):
-            if self.kernel_size > H or self.kernel_size > W:
-                start_h = (self.kernel_size - H) // 2
-                start_w = (self.kernel_size - W) // 2
-                return k[:, start_h:start_h+H, start_w:start_w+W]
-            return jnp.pad(
-                k,
-                ((0, 0), (pad_h, max(0, pad_h_after)), (pad_w, max(0, pad_w_after))),
-                mode='constant'
-            )
-
-        # Batch kernel FFTs: stack and do single FFT call (2 -> 1 FFT)
-        k_stacked = jnp.stack([pad_kernel(k_exc), pad_kernel(k_inh)], axis=0)  # (2, C, H, W)
-        K_stacked_raw = jnp.fft.rfft2(k_stacked, axes=(2, 3))  # (2, C, H, W_f)
-        K_E_raw, K_I_raw = K_stacked_raw[0], K_stacked_raw[1]
-        # Squash coupling kernel magnitudes to ensure 2x2 matrix spectral radius < 1
-        K_E_spec = _stable_spectral_magnitude(K_E_raw, rho=self.spectral_rho)
-        K_I_spec = _stable_spectral_magnitude(K_I_raw, rho=self.spectral_rho)
-
-        # --- 2. FFT Input ---
-        x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-
-        # --- 3. Input-Dependent Per-Channel Per-Frequency Gates (1x1 conv style) ---
-        # Pool spatial dims for gating context: (B, T, H, W, C) -> (B, T, C)
-        ctx = x.mean(axis=(2, 3))
-
-        # Add temporal position encoding to context
-        # This allows gates to vary with timestep even when input is static (repeated image)
-        ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
-
-        # Gate output size: per-channel AND per-frequency (like 1x1 conv)
-        gate_size = C * H * W_freq
-
-        # === Per-channel, per-frequency decay gates (diagonal elements) ===
-        # alpha: X self-decay, delta: Y self-decay
-        alpha_raw = self._compute_gate(ctx, gate_size, 'alpha_gate')  # (B, T, C*H*W_freq)
-        alpha_freq = self._apply_gate_activation(alpha_raw).reshape(B, T, C, H, W_freq)
-
-        delta_raw = self._compute_gate(ctx, gate_size, 'delta_gate')  # (B, T, C*H*W_freq)
-        delta_freq = self._apply_gate_activation(delta_raw).reshape(B, T, C, H, W_freq)
-
-        # === Per-channel, per-frequency coupling gates (off-diagonal elements) ===
-        # mu: inhibition Y->X, gamma: excitation X->Y
-        mu_raw = self._compute_gate(ctx, gate_size, 'mu_gate')  # (B, T, C*H*W_freq)
-        mu_freq = self._apply_gate_activation(mu_raw).reshape(B, T, C, H, W_freq)
-
-        gamma_raw = self._compute_gate(ctx, gate_size, 'gamma_gate')  # (B, T, C*H*W_freq)
-        gamma_freq = self._apply_gate_activation(gamma_raw).reshape(B, T, C, H, W_freq)
-
-        # === B gate: Per-channel, per-frequency input projection ===
-        B_gate_raw = self._compute_gate(ctx, gate_size, 'B_gate')  # (B, T, C*H*W_freq)
-        B_gate = nn.sigmoid(B_gate_raw).reshape(B, T, C, H, W_freq)
-
-        # === C gate: Per-channel, per-frequency output projection ===
-        C_gate_raw = self._compute_gate(ctx, gate_size, 'C_gate')  # (B, T, C*H*W_freq)
-        C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, C, H, W_freq)
-
-        # --- 4. Learnable Decay Parameter ---
-        # Base decay is learnable per-channel (initialized near 0.9)
-        decay_init = nn.initializers.constant(0.9)
-        decay_param = self.param('decay', decay_init, (C,))
-        decay = jnp.clip(decay_param, 0.1, 0.99)  # Keep in stable range
-
-        # --- 5. Build Transition Matrix ---
-        # Target shape: (B, T, C, H, W_freq, 2, 2)
-
-        # Broadcast kernels: (C, H, W_freq) -> (1, 1, C, H, W_freq)
-        K_E = K_E_spec[None, None, ...]
-        K_I = K_I_spec[None, None, ...]
-
-        # Broadcast decay: (C,) -> (1, 1, C, 1, 1)
-        b_decay = decay[None, None, :, None, None]
-        decay_complex = b_decay.astype(jnp.complex64)
-
-        # Build 2x2 transition matrix elements with per-frequency gates
-        # A_xx = decay * alpha_freq (self-connection for X)
-        # A_xy = -K_I * mu_freq (inhibition from Y to X, negative)
-        # A_yx = K_E * gamma_freq (excitation from X to Y)
-        # A_yy = decay * delta_freq (self-connection for Y)
-
-        A_xx = decay_complex * alpha_freq * jnp.ones_like(K_E)
-        A_xy = -1.0 * K_I * mu_freq  # Negative for inhibition
-        A_yx = K_E * gamma_freq
-        A_yy = decay_complex * delta_freq * jnp.ones_like(K_E)
-
-        # Stack into (B, T, C, H, W_freq, 2, 2)
-        row0 = jnp.stack([A_xx, A_xy], axis=-1)
-        row1 = jnp.stack([A_yx, A_yy], axis=-1)
-        K_mat = jnp.stack([row0, row1], axis=-2)
-
-        # --- 6. Apply B gate to input (Mamba-style input projection) ---
-        U_modulated = U_hat * B_gate  # (B, T, C, H, W_freq)
-
-        # Input drives X channel (index 0), Y channel gets zero input
-        U_vec = jnp.stack([U_modulated, jnp.zeros_like(U_modulated)], axis=-1)  # (..., 2)
-
-        # --- 7. Log-Space Scan (using GOOM) ---
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
-
-        _, State_log = jax.lax.associative_scan(
-            cssm_matrix_scan_op, (K_log, U_log), axis=1
-        )
-
-        # --- 8. Apply C gate to output and Inverse Transform ---
-        if self.concat_xy:
-            # State_log has shape (..., 2) where last dim is [X, Y]
-            XY_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 2)
-
-            # Apply C gate to both X and Y channels before IFFT
-            # C_gate: (B, T, 1, H, W_freq) -> broadcast over C and apply to both X,Y
-            XY_hat_modulated = XY_hat * C_gate[..., None]  # (B, T, C, H, W_freq, 2)
-
-            # Move channel dim for batched IFFT: (B, T, C, H, W_freq, 2) -> (B, T, C, 2, H, W_freq)
-            XY_hat_modulated = XY_hat_modulated.transpose(0, 1, 2, 5, 3, 4)
-            # Reshape to batch the 2 channels: (B, T, C*2, H, W_freq)
-            XY_hat_modulated = XY_hat_modulated.reshape(B, T, C * 2, H, -1)
-            xy_out = jnp.fft.irfft2(XY_hat_modulated, s=(H, W), axes=(3, 4))  # (B, T, C*2, H, W)
-            xy_out = xy_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C*2)
-            return nn.Dense(C, name='output_proj')(xy_out)
-        else:
-            # Only need Y channel (index 1)
-            Y_log = State_log[..., 1]
-            Y_hat = from_goom(Y_log)
-
-            # Apply C gate to Y channel before IFFT
-            Y_hat_modulated = Y_hat * C_gate  # (B, T, C, H, W_freq)
-
-            y_out = jnp.fft.irfft2(Y_hat_modulated, s=(H, W), axes=(3, 4))
-            y_out = y_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-            return y_out
-
-    def _forward_lmme(self, x, B, T, H, W, C, W_freq):
-        """
-        LMME forward pass with channel mixing within E and I pools.
-
-        This implements hGRU-style horizontal connections where:
-        - E neurons can influence other E neurons in the same block
-        - I neurons can influence other I neurons in the same block
-        - E↔I coupling happens across channels within blocks
-
-        The state per block is [X_block, Y_block] = 2*block_size dimensions.
-        Transition is a (2*block_size) × (2*block_size) matrix per spatial frequency.
-        """
-        block_size = min(self.block_size, C)
-
-        # Pad channels if needed
-        if C % block_size != 0:
-            pad_c = block_size - (C % block_size)
-            x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 0), (0, pad_c)))
-            C_padded = C + pad_c
-        else:
-            C_padded = C
-            pad_c = 0
-
-        num_blocks = C_padded // block_size
-
-        # === Apply RoPE before FFT ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Block-Diagonal Kernels for E and I ---
-        # Shape: (num_blocks, block_size, block_size, kernel_size, kernel_size)
-        # This allows channels within a block to mix in both E and I pools
-        k_E_blocks = self.param(
-            'k_E_blocks',
-            nn.initializers.normal(0.02),
-            (num_blocks, block_size, block_size, self.kernel_size, self.kernel_size)
-        )
-        k_I_blocks = self.param(
-            'k_I_blocks',
-            nn.initializers.normal(0.02),
-            (num_blocks, block_size, block_size, self.kernel_size, self.kernel_size)
-        )
-
-        # --- 2. Pad and FFT kernels ---
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        def pad_block_kernel(k):
-            # k: (num_blocks, block_size, block_size, kernel_size, kernel_size)
-            if self.kernel_size > H or self.kernel_size > W:
-                start_h = (self.kernel_size - H) // 2
-                start_w = (self.kernel_size - W) // 2
-                return k[..., start_h:start_h+H, start_w:start_w+W]
-            return jnp.pad(
-                k,
-                ((0, 0), (0, 0), (0, 0),
-                 (pad_h, max(0, pad_h_after)), (pad_w, max(0, pad_w_after))),
-                mode='constant'
-            )
-
-        K_E_padded = pad_block_kernel(k_E_blocks)
-        K_I_padded = pad_block_kernel(k_I_blocks)
-
-        # FFT: (num_blocks, block_size, block_size, H, W) -> (num_blocks, block_size, block_size, H, W_freq)
-        K_E_hat_raw = jnp.fft.rfft2(K_E_padded, axes=(3, 4))
-        K_I_hat_raw = jnp.fft.rfft2(K_I_padded, axes=(3, 4))
-
-        # Stabilize spectral magnitude
-        K_E_hat = _stable_spectral_magnitude(K_E_hat_raw, rho=self.spectral_rho)
-        K_I_hat = _stable_spectral_magnitude(K_I_hat_raw, rho=self.spectral_rho)
-
-        # --- 3. FFT Input ---
-        x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C_padded, H, W)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C_padded, H, W_freq)
-
-        # Reshape to blocks: (B, T, num_blocks, block_size, H, W_freq)
-        U_hat_blocks = U_hat.reshape(B, T, num_blocks, block_size, H, W_freq)
-
-        # --- 4. Input-Dependent Per-Channel Gates (1x1 conv style) ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C_padded) - use full channel context for expressivity
-
-        # Add temporal position encoding to context
-        # This allows gates to vary with timestep even when input is static (repeated image)
-        ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
-
-        # Per-channel gate size (full 1x1 conv equivalent)
-        n_gate_feats = C_padded * H * W_freq  # Per-channel, per-frequency
-
-        # Decay gates for E and I - shape (B, T, num_blocks, H, W_freq, block_size, 1)
-        # Each channel within a block gets its own decay
-        alpha_raw = self._compute_gate(ctx, n_gate_feats, 'alpha_gate')
-        alpha_freq = self._apply_gate_activation(alpha_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-        alpha_freq = alpha_freq.transpose(0, 1, 2, 4, 5, 3)[..., None]  # (B, T, num_blocks, H, W_freq, block_size, 1)
-
-        delta_raw = self._compute_gate(ctx, n_gate_feats, 'delta_gate')
-        delta_freq = self._apply_gate_activation(delta_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-        delta_freq = delta_freq.transpose(0, 1, 2, 4, 5, 3)[..., None]  # (B, T, num_blocks, H, W_freq, block_size, 1)
-
-        # Coupling gates - per-channel modulation of the coupling kernels
-        mu_raw = self._compute_gate(ctx, n_gate_feats, 'mu_gate')
-        mu_freq = self._apply_gate_activation(mu_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-        mu_freq = mu_freq.transpose(0, 1, 2, 4, 5, 3)[..., None]  # (B, T, num_blocks, H, W_freq, block_size, 1)
-
-        gamma_raw = self._compute_gate(ctx, n_gate_feats, 'gamma_gate')
-        gamma_freq = self._apply_gate_activation(gamma_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-        gamma_freq = gamma_freq.transpose(0, 1, 2, 4, 5, 3)[..., None]  # (B, T, num_blocks, H, W_freq, block_size, 1)
-
-        # B and C gates - per-channel input/output gating
-        B_gate_raw = self._compute_gate(ctx, n_gate_feats, 'B_gate')
-        B_gate = nn.sigmoid(B_gate_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-
-        C_gate_raw = self._compute_gate(ctx, n_gate_feats, 'C_gate')
-        C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, num_blocks, block_size, H, W_freq)
-
-        # --- 5. Learnable Decay ---
-        decay_init = nn.initializers.constant(0.9)
-        decay_param = self.param('decay', decay_init, (num_blocks,))
-        decay = jnp.clip(decay_param, 0.1, 0.99)
-        # Shape: (1, 1, num_blocks, 1, 1, 1, 1) to broadcast with (B, T, num_blocks, H, W_freq, bs, bs)
-        decay = decay[None, None, :, None, None, None, None].astype(jnp.complex64)
-
-        # --- 6. Build 2*block_size × 2*block_size Transition Matrix ---
-        # K_E_hat, K_I_hat: (num_blocks, block_size, block_size, H, W_freq)
-        # Transpose to (1, 1, num_blocks, H, W_freq, block_size, block_size)
-        K_E = K_E_hat.transpose(0, 3, 4, 1, 2)[None, None, ...]  # (1, 1, num_blocks, H, W_freq, bs, bs)
-        K_I = K_I_hat.transpose(0, 3, 4, 1, 2)[None, None, ...]
-
-        # Build identity matrices for diagonal blocks
-        # Shape: (1, 1, 1, 1, 1, bs, bs) to broadcast with (B, T, num_blocks, H, W_freq, bs, bs)
-        eye_block = jnp.eye(block_size, dtype=jnp.complex64)
-        eye_block = eye_block[None, None, None, None, None, :, :]
-
-        # A_XX = decay * alpha * I (E self-decay, diagonal)
-        A_XX = decay * alpha_freq * eye_block
-
-        # A_XY = -K_I * mu (I -> E inhibition, with channel mixing)
-        A_XY = -1.0 * K_I * mu_freq
-
-        # A_YX = K_E * gamma (E -> I excitation, with channel mixing)
-        A_YX = K_E * gamma_freq
-
-        # A_YY = decay * delta * I (I self-decay, diagonal)
-        A_YY = decay * delta_freq * eye_block
-
-        # Stack into (B, T, num_blocks, H, W_freq, 2*block_size, 2*block_size)
-        # Top row: [A_XX, A_XY]
-        # Bottom row: [A_YX, A_YY]
-        top_row = jnp.concatenate([A_XX, A_XY], axis=-1)  # (..., bs, 2*bs)
-        bottom_row = jnp.concatenate([A_YX, A_YY], axis=-1)
-        K_mat = jnp.concatenate([top_row, bottom_row], axis=-2)  # (..., 2*bs, 2*bs)
-
-        # Broadcast to full batch/time dims
-        K_mat = jnp.broadcast_to(K_mat, (B, T, num_blocks, H, W_freq, 2*block_size, 2*block_size))
-
-        # --- 7. Prepare Input Vector ---
-        # Apply B gate
-        U_modulated = U_hat_blocks * B_gate  # (B, T, num_blocks, block_size, H, W_freq)
-
-        # Transpose for scan: (B, T, num_blocks, H, W_freq, block_size)
-        U_perm = U_modulated.transpose(0, 1, 2, 4, 5, 3)
-
-        # Input drives E (X), I (Y) gets zero: [U, 0]
-        zeros = jnp.zeros_like(U_perm)
-        U_vec = jnp.concatenate([U_perm, zeros], axis=-1)  # (B, T, num_blocks, H, W_freq, 2*block_size)
-
-        # --- 8. Log-Space Scan ---
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
-
-        # Flatten spatial frequencies with batch for scan
-        K_flat = K_log.reshape(B * num_blocks * H * W_freq, T, 2*block_size, 2*block_size)
-        U_flat = U_log.reshape(B * num_blocks * H * W_freq, T, 2*block_size)
-
-        # Scan over time
-        block_scan_op = make_block_scan_op(2 * block_size)
-        _, State_log_flat = jax.lax.associative_scan(
-            block_scan_op, (K_flat, U_flat), axis=1
-        )
-
-        # Reshape back: (B, num_blocks, H, W_freq, T, 2*block_size)
-        State_log = State_log_flat.reshape(B, num_blocks, H, W_freq, T, 2*block_size)
-        State_log = State_log.transpose(0, 4, 1, 2, 3, 5)  # (B, T, num_blocks, H, W_freq, 2*block_size)
-
-        # --- 9. Extract E and I, Apply C gate, Inverse Transform ---
-        State_hat = from_goom(State_log)
-
-        # Split into E and I
-        E_hat = State_hat[..., :block_size]  # (B, T, num_blocks, H, W_freq, block_size)
-        I_hat = State_hat[..., block_size:]
-
-        # Apply C gate (per-channel gating)
-        # C_gate: (B, T, num_blocks, block_size, H, W_freq)
-        C_gate_expanded = C_gate.transpose(0, 1, 2, 4, 5, 3)  # (B, T, num_blocks, H, W_freq, block_size)
-        E_hat_gated = E_hat * C_gate_expanded
-        I_hat_gated = I_hat * C_gate_expanded
-
-        if self.concat_xy:
-            # Concat E and I, then project
-            EI_hat = jnp.concatenate([E_hat_gated, I_hat_gated], axis=-1)  # (..., 2*block_size)
-
-            # Reshape for IFFT: (B, T, num_blocks, H, W_freq, 2*block_size)
-            #   -> (B, T, num_blocks * 2 * block_size, H, W_freq)
-            EI_hat_flat = EI_hat.transpose(0, 1, 2, 5, 3, 4)  # (B, T, num_blocks, 2*bs, H, W_freq)
-            EI_hat_flat = EI_hat_flat.reshape(B, T, num_blocks * 2 * block_size, H, W_freq)
-
-            ei_out = jnp.fft.irfft2(EI_hat_flat, s=(H, W), axes=(3, 4))  # (B, T, C*2, H, W)
-            ei_out = ei_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C*2)
-
-            # Remove padding if needed
-            if pad_c > 0:
-                ei_out = ei_out[..., :C*2]
-
-            return nn.Dense(C, name='output_proj')(ei_out)
-        else:
-            # Only return I (inhibition output)
-            I_hat_flat = I_hat_gated.transpose(0, 1, 2, 5, 3, 4)  # (B, T, num_blocks, bs, H, W_freq)
-            I_hat_flat = I_hat_flat.reshape(B, T, C_padded, H, W_freq)
-
-            i_out = jnp.fft.irfft2(I_hat_flat, s=(H, W), axes=(3, 4))
-            i_out = i_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C_padded)
-
-            if pad_c > 0:
-                i_out = i_out[..., :C]
-
-            return i_out
-
-
-class BilinearOpponentCSSM(nn.Module):
-    """
-    3x3 Bilinear Opponent CSSM with hGRU-style X² inhibition.
-
-    State: [X, Y, Z] where:
-    - X: Excitatory state
-    - Y: Inhibitory state (accumulates over time)
-    - Z: Delayed X (Z_t = X_{t-1})
-
-    Key feature: Inhibition includes X*Z term, giving X² dynamics:
-    X_t = U - K_I*ν*X*Z - K_I*μ*Y + α*X
-        ≈ U - K_I*ν*X² - K_I*μ*Y + α*X  (hGRU-style!)
-
-    In log-space, X*Z becomes log(X) + log(Z) — just addition!
-
-    Attributes:
-        channels: Number of input/output channels
-        kernel_size: Spatial kernel size for excitation/inhibition kernels
-        spectral_rho: Maximum spectral magnitude for stability (should be < 1)
-        gate_activation: Activation for gates ('sigmoid', 'softplus')
-        rope_mode: Position encoding mode ('spatiotemporal', 'temporal', 'none')
-        rope_base: Base for RoPE frequency computation
-    """
-    channels: int
-    kernel_size: int = 11
-    spectral_rho: float = 0.999
-    gate_activation: str = 'sigmoid'
-    rope_mode: str = 'none'
-    rope_base: float = 10000.0
-    gate_rank: int = 0  # If > 0, use low-rank gates: Dense(C -> rank) -> Dense(rank -> n_feats)
-    # API compatibility attributes
-    concat_xy: bool = True
-    dense_mixing: bool = False
-    block_size: int = 32
-
-    def _low_rank_gate(self, ctx: jnp.ndarray, n_out: int, name: str) -> jnp.ndarray:
-        """Low-rank gate projection to reduce parameters."""
-        if self.gate_rank > 0:
-            # Bottleneck: C -> rank -> n_out
-            x = nn.Dense(self.gate_rank, name=f'{name}_down')(ctx)
-            x = nn.gelu(x)
-            x = nn.Dense(n_out, name=f'{name}_up')(x)
-        else:
-            # Direct projection: C -> n_out
-            x = nn.Dense(n_out, name=name)(ctx)
-        return x
-
-    def _apply_gate_activation(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Apply configured activation to gate values."""
-        if self.gate_activation == 'sigmoid':
-            return nn.sigmoid(x)
-        elif self.gate_activation == 'softplus':
-            return nn.softplus(x)
-        else:
-            return nn.sigmoid(x)
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass with 3x3 hGRU-style dynamics.
-
-        Uses linear 3x3 state dynamics with Z = X_{t-1} for delayed self-inhibition.
-        The X update includes: -K_I*ν*Z (delayed inhibition) and -K_I*μ*Y (surround inhibition).
-
-        Args:
-            x: Input tensor of shape (B, T, H, W, C)
-
-        Returns:
-            Output tensor of shape (B, T, H, W, C)
-        """
-        B, T, H, W, C = x.shape
-        W_freq = W // 2 + 1
-
-        # Route to LMME if block_size > 1
-        if self.block_size > 1:
-            return self._forward_lmme(x, B, T, H, W, C, W_freq)
-
-        from .math import cssm_3x3_matrix_scan_op
-
-        # === Apply RoPE before FFT ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Spatial Kernels ---
-        k_shape = (C, self.kernel_size, self.kernel_size)
-        k_exc = self.param('k_exc', nn.initializers.normal(0.02), k_shape)
-        k_inh = self.param('k_inh', nn.initializers.normal(0.02), k_shape)
-
-        # Pad and FFT kernels
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        def pad_kernel(k):
-            if self.kernel_size > H or self.kernel_size > W:
-                start_h = (self.kernel_size - H) // 2
-                start_w = (self.kernel_size - W) // 2
-                return k[:, start_h:start_h+H, start_w:start_w+W]
-            return jnp.pad(k, ((0, 0), (pad_h, max(0, pad_h_after)),
-                               (pad_w, max(0, pad_w_after))), mode='constant')
-
-        K_E_raw = jnp.fft.rfft2(pad_kernel(k_exc), axes=(1, 2))
-        K_I_raw = jnp.fft.rfft2(pad_kernel(k_inh), axes=(1, 2))
-        K_E = _stable_spectral_magnitude(K_E_raw, rho=self.spectral_rho)
-        K_I = _stable_spectral_magnitude(K_I_raw, rho=self.spectral_rho)
-
-        # --- 2. FFT Input ---
-        x_perm = x.transpose(0, 1, 4, 2, 3)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-
-        # --- 3. Input-Dependent Gates ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C)
-        n_gate_feats = H * W_freq
-
-        # Decay gates - use low-rank if gate_rank > 0
-        alpha_raw = self._low_rank_gate(ctx, n_gate_feats, 'alpha_gate')
-        alpha_freq = self._apply_gate_activation(alpha_raw).reshape(B, T, 1, H, W_freq)
-
-        delta_raw = self._low_rank_gate(ctx, n_gate_feats, 'delta_gate')
-        delta_freq = self._apply_gate_activation(delta_raw).reshape(B, T, 1, H, W_freq)
-
-        # Coupling gates
-        mu_raw = self._low_rank_gate(ctx, n_gate_feats, 'mu_gate')  # Y -> X inhibition
-        mu_freq = self._apply_gate_activation(mu_raw).reshape(B, T, 1, H, W_freq)
-
-        nu_raw = self._low_rank_gate(ctx, n_gate_feats, 'nu_gate')  # Z -> X inhibition (delayed self)
-        nu_freq = self._apply_gate_activation(nu_raw).reshape(B, T, 1, H, W_freq)
-
-        gamma_raw = self._low_rank_gate(ctx, n_gate_feats, 'gamma_gate')  # X -> Y excitation
-        gamma_freq = self._apply_gate_activation(gamma_raw).reshape(B, T, 1, H, W_freq)
-
-        # I/O gates
-        B_gate_raw = self._low_rank_gate(ctx, n_gate_feats, 'B_gate')
-        B_gate = nn.sigmoid(B_gate_raw).reshape(B, T, 1, H, W_freq)
-
-        C_gate_raw = self._low_rank_gate(ctx, n_gate_feats, 'C_gate')
-        C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, 1, H, W_freq)
-
-        # --- 4. Learnable Decay ---
-        decay = jnp.clip(self.param('decay', nn.initializers.constant(0.9), (C,)), 0.1, 0.99)
-        b_decay = decay[None, None, :, None, None].astype(jnp.complex64)
-
-        # --- 5. Build 3x3 Transition Matrix ---
-        K_E_b = K_E[None, None, ...]  # (1, 1, C, H, W_freq)
-        K_I_b = K_I[None, None, ...]
-
-        # Matrix elements (in linear space, will convert to log)
-        # All elements need shape (B, T, C, H, W_freq) for stacking
-        target_shape = (B, T, C, H, W_freq)
-        ones_full = jnp.broadcast_to(jnp.ones_like(K_E_b), target_shape)
-        zeros_full = jnp.broadcast_to(jnp.zeros_like(K_E_b), target_shape)
-
-        # Row 0 (X update): X_t = α*X - K_I*μ*Y - K_I*ν*Z + U
-        # Linear delayed self-inhibition via Z (approximates hGRU's X² term)
-        A_xx = b_decay * alpha_freq * ones_full
-        A_xy = -1.0 * K_I_b * mu_freq  # Negative for inhibition from Y
-        A_xz = -1.0 * K_I_b * nu_freq  # Negative for delayed self-inhibition from Z
-
-        # Row 1 (Y update): Y_t = K_E*γ*X + δ*Y + 0*Z
-        A_yx = K_E_b * gamma_freq
-        A_yy = b_decay * delta_freq * ones_full
-        A_yz = zeros_full
-
-        # Row 2 (Z update): Z_t = 1*X + 0*Y + 0*Z  (Z = X_{t-1})
-        A_zx = ones_full
-        A_zy = zeros_full
-        A_zz = zeros_full
-
-        # Stack into 3x3: (B, T, C, H, W_freq, 3, 3)
-        row0 = jnp.stack([A_xx, A_xy, A_xz], axis=-1)
-        row1 = jnp.stack([A_yx, A_yy, A_yz], axis=-1)
-        row2 = jnp.stack([A_zx, A_zy, A_zz], axis=-1)
-        K_mat = jnp.stack([row0, row1, row2], axis=-2)
-
-        # --- 6. Input vector: [U, 0, 0] ---
-        U_modulated = U_hat * B_gate
-        zeros = jnp.zeros_like(U_modulated)
-        U_vec = jnp.stack([U_modulated, zeros, zeros], axis=-1)  # (B, T, C, H, W_freq, 3)
-
-        # --- 7. Log-Space Scan ---
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
-
-        # Use linear 3x3 scan (delayed self-inhibition via A_xz)
-        _, State_log = jax.lax.associative_scan(
-            cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
-        )
-
-        # --- 8. Output: Use X state ---
-        X_log = State_log[..., 0]  # Take X component (B, T, C, H, W_freq)
-        X_hat = from_goom(X_log)
-        X_hat_modulated = X_hat * C_gate
-
-        x_out = jnp.fft.irfft2(X_hat_modulated, s=(H, W), axes=(3, 4))
-        return x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-
-    def _forward_lmme(self, x, B, T, H, W, C, W_freq):
-        """
-        LMME forward pass with channel mixing for 3x3 bilinear CSSM.
-
-        Uses 3*block_size × 3*block_size transition matrices where:
-        - X, Y, Z each have block_size channels that can mix
-        - Cross-channel spatial mixing via K_E (excitation) and K_I (inhibition)
-        - Enables association field-style curve propagation
-
-        State per block: [X_block, Y_block, Z_block] = 3*block_size dimensions
-        """
-        from .math import make_block_scan_op
-
-        block_size = min(self.block_size, C)
-
-        # Pad channels if needed
-        if C % block_size != 0:
-            pad_c = block_size - (C % block_size)
-            x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 0), (0, pad_c)))
-            C_padded = C + pad_c
-        else:
-            C_padded = C
-            pad_c = 0
-
-        num_blocks = C_padded // block_size
-
-        # === Apply RoPE before FFT ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Block-Diagonal Kernels for E and I ---
-        # Shape: (num_blocks, block_size, block_size, kernel_size, kernel_size)
-        k_E_blocks = self.param(
-            'k_E_blocks',
-            nn.initializers.normal(0.02),
-            (num_blocks, block_size, block_size, self.kernel_size, self.kernel_size)
-        )
-        k_I_blocks = self.param(
-            'k_I_blocks',
-            nn.initializers.normal(0.02),
-            (num_blocks, block_size, block_size, self.kernel_size, self.kernel_size)
-        )
-
-        # --- 2. Pad and FFT kernels ---
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        def pad_block_kernel(k):
-            if self.kernel_size > H or self.kernel_size > W:
-                start_h = (self.kernel_size - H) // 2
-                start_w = (self.kernel_size - W) // 2
-                return k[..., start_h:start_h+H, start_w:start_w+W]
-            return jnp.pad(
-                k,
-                ((0, 0), (0, 0), (0, 0),
-                 (pad_h, max(0, pad_h_after)), (pad_w, max(0, pad_w_after))),
-                mode='constant'
-            )
-
-        K_E_padded = pad_block_kernel(k_E_blocks)
-        K_I_padded = pad_block_kernel(k_I_blocks)
-
-        # FFT: (num_blocks, bs, bs, H, W) -> (num_blocks, bs, bs, H, W_freq)
-        K_E_hat_raw = jnp.fft.rfft2(K_E_padded, axes=(3, 4))
-        K_I_hat_raw = jnp.fft.rfft2(K_I_padded, axes=(3, 4))
-
-        K_E_hat = _stable_spectral_magnitude(K_E_hat_raw, rho=self.spectral_rho)
-        K_I_hat = _stable_spectral_magnitude(K_I_hat_raw, rho=self.spectral_rho)
-
-        # --- 3. FFT Input ---
-        x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C_padded, H, W)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C_padded, H, W_freq)
-
-        # Reshape to blocks: (B, T, num_blocks, block_size, H, W_freq)
-        U_hat_blocks = U_hat.reshape(B, T, num_blocks, block_size, H, W_freq)
-
-        # --- 4. Input-Dependent Gates ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C_padded)
-
-        n_gate_feats = num_blocks * H * W_freq
-
-        # Decay gates - shape (B, T, num_blocks, H, W_freq, 1, 1)
-        # Use low-rank gates if gate_rank > 0 to reduce parameters
-        alpha_raw = self._low_rank_gate(ctx, n_gate_feats, 'alpha_gate')
-        alpha_freq = self._apply_gate_activation(alpha_raw).reshape(B, T, num_blocks, H, W_freq, 1, 1)
-
-        delta_raw = self._low_rank_gate(ctx, n_gate_feats, 'delta_gate')
-        delta_freq = self._apply_gate_activation(delta_raw).reshape(B, T, num_blocks, H, W_freq, 1, 1)
-
-        # Coupling gates
-        mu_raw = self._low_rank_gate(ctx, n_gate_feats, 'mu_gate')  # Y -> X
-        mu_freq = self._apply_gate_activation(mu_raw).reshape(B, T, num_blocks, H, W_freq, 1, 1)
-
-        nu_raw = self._low_rank_gate(ctx, n_gate_feats, 'nu_gate')  # Z -> X (delayed self-inhibition)
-        nu_freq = self._apply_gate_activation(nu_raw).reshape(B, T, num_blocks, H, W_freq, 1, 1)
-
-        gamma_raw = self._low_rank_gate(ctx, n_gate_feats, 'gamma_gate')  # X -> Y
-        gamma_freq = self._apply_gate_activation(gamma_raw).reshape(B, T, num_blocks, H, W_freq, 1, 1)
-
-        # B and C gates
-        B_gate_raw = self._low_rank_gate(ctx, n_gate_feats, 'B_gate')
-        B_gate = nn.sigmoid(B_gate_raw).reshape(B, T, num_blocks, 1, H, W_freq)
-
-        C_gate_raw = self._low_rank_gate(ctx, n_gate_feats, 'C_gate')
-        C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, num_blocks, 1, H, W_freq)
-
-        # --- 5. Learnable Decay ---
-        decay_param = self.param('decay', nn.initializers.constant(0.9), (num_blocks,))
-        decay = jnp.clip(decay_param, 0.1, 0.99)
-        decay = decay[None, None, :, None, None, None, None].astype(jnp.complex64)
-
-        # --- 6. Build 3*block_size × 3*block_size Transition Matrix ---
-        # K_E_hat, K_I_hat: (num_blocks, bs, bs, H, W_freq)
-        # Transpose to (1, 1, num_blocks, H, W_freq, bs, bs)
-        K_E = K_E_hat.transpose(0, 3, 4, 1, 2)[None, None, ...]
-        K_I = K_I_hat.transpose(0, 3, 4, 1, 2)[None, None, ...]
-
-        # Identity block for diagonal terms
-        eye_block = jnp.eye(block_size, dtype=jnp.complex64)
-        eye_block = eye_block[None, None, None, None, None, :, :]
-
-        # Zero block
-        zero_block = jnp.zeros((block_size, block_size), dtype=jnp.complex64)
-        zero_block = zero_block[None, None, None, None, None, :, :]
-
-        # Row 0 (X update): X = α*X - K_I*μ*Y - K_I*ν*Z + U
-        A_XX = decay * alpha_freq * eye_block  # Self-decay (diagonal)
-        A_XY = -1.0 * K_I * mu_freq            # Y -> X inhibition (full block mixing)
-        A_XZ = -1.0 * K_I * nu_freq            # Z -> X delayed inhibition (full block mixing)
-
-        # Row 1 (Y update): Y = K_E*γ*X + δ*Y
-        A_YX = K_E * gamma_freq                # X -> Y excitation (full block mixing)
-        A_YY = decay * delta_freq * eye_block  # Self-decay (diagonal)
-        A_YZ = zero_block                      # No Z -> Y
-
-        # Row 2 (Z update): Z = X (Z tracks X with 1-step delay)
-        A_ZX = eye_block                       # X -> Z (identity, diagonal)
-        A_ZY = zero_block                      # No Y -> Z
-        A_ZZ = zero_block                      # No Z -> Z (Z is replaced each step)
-
-        # Broadcast all blocks to full shape
-        full_shape = (B, T, num_blocks, H, W_freq, block_size, block_size)
-        A_XX = jnp.broadcast_to(A_XX, full_shape)
-        A_XY = jnp.broadcast_to(A_XY, full_shape)
-        A_XZ = jnp.broadcast_to(A_XZ, full_shape)
-        A_YX = jnp.broadcast_to(A_YX, full_shape)
-        A_YY = jnp.broadcast_to(A_YY, full_shape)
-        A_YZ = jnp.broadcast_to(A_YZ, full_shape)
-        A_ZX = jnp.broadcast_to(A_ZX, full_shape)
-        A_ZY = jnp.broadcast_to(A_ZY, full_shape)
-        A_ZZ = jnp.broadcast_to(A_ZZ, full_shape)
-
-        # Stack into 3x3 block matrix: (B, T, num_blocks, H, W_freq, 3*bs, 3*bs)
-        # Top row: [A_XX, A_XY, A_XZ]
-        top_row = jnp.concatenate([A_XX, A_XY, A_XZ], axis=-1)     # (..., bs, 3*bs)
-        mid_row = jnp.concatenate([A_YX, A_YY, A_YZ], axis=-1)     # (..., bs, 3*bs)
-        bot_row = jnp.concatenate([A_ZX, A_ZY, A_ZZ], axis=-1)     # (..., bs, 3*bs)
-        K_mat = jnp.concatenate([top_row, mid_row, bot_row], axis=-2)  # (..., 3*bs, 3*bs)
-
-        # --- 7. Prepare Input Vector ---
-        U_modulated = U_hat_blocks * B_gate  # (B, T, num_blocks, block_size, H, W_freq)
-
-        # Transpose for scan: (B, T, num_blocks, H, W_freq, block_size)
-        U_perm = U_modulated.transpose(0, 1, 2, 4, 5, 3)
-
-        # Input drives X only: [U, 0, 0]
-        zeros = jnp.zeros_like(U_perm)
-        U_vec = jnp.concatenate([U_perm, zeros, zeros], axis=-1)  # (..., 3*block_size)
-
-        # --- 8. Log-Space Scan ---
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
-
-        # Flatten for scan
-        K_flat = K_log.reshape(B * num_blocks * H * W_freq, T, 3*block_size, 3*block_size)
-        U_flat = U_log.reshape(B * num_blocks * H * W_freq, T, 3*block_size)
-
-        # Scan over time
-        block_scan_op = make_block_scan_op(3 * block_size)
-        _, State_log_flat = jax.lax.associative_scan(
-            block_scan_op, (K_flat, U_flat), axis=1
-        )
-
-        # Reshape back
-        State_log = State_log_flat.reshape(B, num_blocks, H, W_freq, T, 3*block_size)
-        State_log = State_log.transpose(0, 4, 1, 2, 3, 5)  # (B, T, num_blocks, H, W_freq, 3*bs)
-
-        # --- 9. Extract X, Apply C gate, Inverse Transform ---
-        State_hat = from_goom(State_log)
-
-        # Take X component (first block_size elements)
-        X_hat = State_hat[..., :block_size]  # (B, T, num_blocks, H, W_freq, block_size)
-
-        # Apply C gate and transpose
-        X_hat_gated = X_hat.transpose(0, 1, 2, 5, 3, 4)  # (B, T, num_blocks, bs, H, W_freq)
-        X_hat_gated = X_hat_gated * C_gate
-
-        # Reshape to channels
-        X_hat_channels = X_hat_gated.reshape(B, T, C_padded, H, W_freq)
-
-        # Inverse FFT
-        x_out = jnp.fft.irfft2(X_hat_channels, s=(H, W), axes=(3, 4))
-        x_out = x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C_padded)
-
-        # Remove padding if needed
-        if pad_c > 0:
-            x_out = x_out[..., :C]
-
-        return x_out
-
-
-# =============================================================================
-# LINEAR ABLATION VARIANTS (No Log-Space)
 # =============================================================================
 # These are ablation controls that use regular arithmetic instead of log-space.
 # They use sequential scan (jax.lax.scan) instead of associative scan.
@@ -2001,208 +1047,6 @@ class LinearOpponentCSSM(nn.Module):
         # --- 7. Inverse FFT ---
         x_out = jnp.fft.irfft2(X_out_gated, s=(H, W), axes=(3, 4))
         return x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-
-
-class HGRUStyleCSSM(nn.Module):
-    """
-    hGRU-style CSSM with linear opponent dynamics via PARALLEL associative scan.
-
-    Implements linearized hGRU equations using GOOM log-space:
-
-        X_t = decay_x·X_{t-1} − μ_inhib·K_I·Y_{t-1} + U_X
-        Y_t = decay_y·Y_{t-1} + μ_excit·K_E·X_{t-1} + U_Y
-
-    Key design choices:
-    - ALL parameters are input-dependent gates (decay, coupling, I/O)
-    - Separate gates for inhibition vs excitation pathways
-    - Both X and Y receive transformed input (not just X)
-    - Xavier initialization for spatial kernels
-    - No bilinear terms (clean linear dynamics for associative scan)
-
-    In log-spectral (GOOM) domain:
-    - Convolution → Multiplication → Addition
-    - Stable numerical dynamics without clipping
-
-    Attributes:
-        channels: Number of input/output channels
-        kernel_size: Spatial kernel size for E/I kernels
-        spectral_rho: Maximum spectral magnitude for stability
-        gate_activation: Activation for gates ('sigmoid', 'softplus')
-        rope_mode: Position encoding mode
-        rope_base: RoPE base frequency
-        concat_xy: If True, concatenate [X, Y] and project to output
-    """
-    channels: int
-    kernel_size: int = 11
-    spectral_rho: float = 0.999
-    gate_activation: str = 'sigmoid'
-    rope_mode: str = 'none'
-    rope_base: float = 10000.0
-    concat_xy: bool = True
-    # API compatibility
-    gate_rank: int = 0
-    dense_mixing: bool = False
-    block_size: int = 1
-
-    def _apply_gate_activation(self, x: jnp.ndarray) -> jnp.ndarray:
-        if self.gate_activation == 'sigmoid':
-            return nn.sigmoid(x)
-        elif self.gate_activation == 'softplus':
-            return nn.softplus(x)
-        else:
-            return nn.sigmoid(x)
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass with linear opponent dynamics using parallel scan.
-
-        Args:
-            x: Input tensor of shape (B, T, H, W, C)
-
-        Returns:
-            Output tensor of shape (B, T, H, W, C)
-        """
-        from .goom import to_goom, from_goom
-
-        B, T, H, W, C = x.shape
-        W_freq = W // 2 + 1
-
-        # === Apply RoPE before FFT ===
-        if self.rope_mode != 'none':
-            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
-
-        # --- 1. Spatial Kernels (Xavier init) ---
-        k_shape = (C, self.kernel_size, self.kernel_size)
-        k_exc = self.param('k_exc', nn.initializers.xavier_normal(), k_shape)
-        k_inh = self.param('k_inh', nn.initializers.xavier_normal(), k_shape)
-
-        pad_h = max(0, (H - self.kernel_size) // 2)
-        pad_w = max(0, (W - self.kernel_size) // 2)
-        pad_h_after = H - self.kernel_size - pad_h
-        pad_w_after = W - self.kernel_size - pad_w
-
-        def pad_kernel(k):
-            if self.kernel_size > H or self.kernel_size > W:
-                start_h = (self.kernel_size - H) // 2
-                start_w = (self.kernel_size - W) // 2
-                return k[:, start_h:start_h+H, start_w:start_w+W]
-            return jnp.pad(k, ((0, 0), (pad_h, max(0, pad_h_after)),
-                               (pad_w, max(0, pad_w_after))), mode='constant')
-
-        K_E_raw = jnp.fft.rfft2(pad_kernel(k_exc), axes=(1, 2))
-        K_I_raw = jnp.fft.rfft2(pad_kernel(k_inh), axes=(1, 2))
-        K_E = _stable_spectral_magnitude(K_E_raw, rho=self.spectral_rho)  # (C, H, W_freq)
-        K_I = _stable_spectral_magnitude(K_I_raw, rho=self.spectral_rho)
-
-        # --- 2. Project input to X and Y pathways (fused) ---
-        # Single Dense(2C) then split - more efficient than two Dense(C)
-        x_flat = x.reshape(B * T, H, W, C)
-        xy_proj = nn.Dense(2 * C, name='input_proj')(x_flat)  # (B*T, H, W, 2C)
-        xy_proj = xy_proj.reshape(B, T, H, W, 2 * C)
-
-        # Split into X and Y input pathways
-        x_input = xy_proj[..., :C]   # (B, T, H, W, C)
-        y_input = xy_proj[..., C:]   # (B, T, H, W, C)
-
-        # FFT both pathways
-        x_perm = x_input.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        y_perm = y_input.transpose(0, 1, 4, 2, 3)
-        U_X_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-        U_Y_hat = jnp.fft.rfft2(y_perm, axes=(3, 4))
-
-        # --- 3. Input-Dependent Gates (ALL gates from context) ---
-        ctx = x.mean(axis=(2, 3))  # (B, T, C)
-        ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
-        n_gate_feats = H * W_freq
-
-        # Decay gates (input-dependent, not static!)
-        decay_x_raw = nn.Dense(n_gate_feats, name='decay_x_gate')(ctx)
-        decay_x_freq = 0.1 + 0.89 * nn.sigmoid(decay_x_raw).reshape(B, T, 1, H, W_freq)  # [0.1, 0.99]
-
-        decay_y_raw = nn.Dense(n_gate_feats, name='decay_y_gate')(ctx)
-        decay_y_freq = 0.1 + 0.89 * nn.sigmoid(decay_y_raw).reshape(B, T, 1, H, W_freq)  # [0.1, 0.99]
-
-        # Separate coupling gates for each direction
-        mu_inhib_raw = nn.Dense(n_gate_feats, name='mu_inhib_gate')(ctx)  # Y -> X inhibition
-        mu_inhib = self._apply_gate_activation(mu_inhib_raw).reshape(B, T, 1, H, W_freq)
-
-        mu_excit_raw = nn.Dense(n_gate_feats, name='mu_excit_gate')(ctx)  # X -> Y excitation
-        mu_excit = self._apply_gate_activation(mu_excit_raw).reshape(B, T, 1, H, W_freq)
-
-        # I/O gates
-        B_gate_raw = nn.Dense(n_gate_feats, name='B_gate')(ctx)  # X input gate
-        B_gate = nn.sigmoid(B_gate_raw).reshape(B, T, 1, H, W_freq)
-
-        D_gate_raw = nn.Dense(n_gate_feats, name='D_gate')(ctx)  # Y input gate
-        D_gate = nn.sigmoid(D_gate_raw).reshape(B, T, 1, H, W_freq)
-
-        C_gate_raw = nn.Dense(n_gate_feats, name='C_gate')(ctx)  # Output gate
-        C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, 1, H, W_freq)
-
-        # --- 4. Build 2x2 Transition Matrix ---
-        # Broadcast kernels: (C, H, W_freq) -> (1, 1, C, H, W_freq)
-        K_E_b = K_E[None, None, ...].astype(jnp.complex64)
-        K_I_b = K_I[None, None, ...].astype(jnp.complex64)
-
-        # Convert decay gates to complex
-        decay_x_c = decay_x_freq.astype(jnp.complex64)
-        decay_y_c = decay_y_freq.astype(jnp.complex64)
-
-        # Linear opponent dynamics:
-        # X_t = decay_x·X − μ_inhib·K_I·Y + U_X   (inhibition from Y)
-        # Y_t = decay_y·Y + μ_excit·K_E·X + U_Y   (excitation from X)
-        #
-        # 2x2 matrix: [decay_x        -μ_inhib·K_I]
-        #             [μ_excit·K_E     decay_y    ]
-
-        A_xx = decay_x_c  # (B, T, 1, H, W_freq) broadcasts to (B, T, C, H, W_freq)
-        A_xy = -1.0 * mu_inhib * K_I_b  # Negative for inhibition
-        A_yx = mu_excit * K_E_b  # Positive for excitation
-        A_yy = decay_y_c
-
-        # Stack into (B, T, C, H, W_freq, 2, 2)
-        row0 = jnp.stack([A_xx * jnp.ones_like(K_E_b), A_xy], axis=-1)
-        row1 = jnp.stack([A_yx, A_yy * jnp.ones_like(K_E_b)], axis=-1)
-        K_mat = jnp.stack([row0, row1], axis=-2)
-
-        # --- 5. Apply I/O gates to input ---
-        U_X_gated = U_X_hat * B_gate  # X pathway input
-        U_Y_gated = U_Y_hat * D_gate  # Y pathway input
-        U_vec = jnp.stack([U_X_gated, U_Y_gated], axis=-1)  # (..., 2)
-
-        # --- 6. Convert to GOOM and Apply Parallel Associative Scan ---
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
-
-        # Linear 2x2 scan operator (no bilinear terms)
-        # PARALLEL scan! O(log T) complexity
-        _, State_log = jax.lax.associative_scan(
-            cssm_matrix_scan_op, (K_log, U_log), axis=1
-        )
-
-        # --- 7. Convert back from GOOM and apply output gate ---
-        if self.concat_xy:
-            XY_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 2)
-            XY_hat_gated = XY_hat * C_gate[..., None]
-
-            # Reshape for IFFT
-            XY_hat_gated = XY_hat_gated.transpose(0, 1, 2, 5, 3, 4)  # (B, T, C, 2, H, W_freq)
-            XY_hat_gated = XY_hat_gated.reshape(B, T, C * 2, H, -1)
-
-            xy_out = jnp.fft.irfft2(XY_hat_gated, s=(H, W), axes=(3, 4))
-            xy_out = xy_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, 2C)
-            return nn.Dense(C, name='output_proj')(xy_out)
-        else:
-            # Use X channel (index 0)
-            X_log = State_log[..., 0]
-            X_hat = from_goom(X_log)
-            X_hat_gated = X_hat * C_gate
-
-            x_out = jnp.fft.irfft2(X_hat_gated, s=(H, W), axes=(3, 4))
-            return x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-
-
 class HGRUBilinearCSSM(nn.Module):
     """
     hGRU-style CSSM with 3x3 Interaction Channel (hgru_bi mode).
@@ -2539,7 +1383,12 @@ class TransformerCSSM(nn.Module):
     readout_state: str = 'qka'  # 'qka', 'q', 'k', 'a', 'qk', 'qa', 'ka'
     pre_output_act: str = 'none'
     position_independent_gates: bool = False  # Compute gates from raw input for length generalization
-    use_goom: bool = True  # Use GOOM (log-space) for numerical stability; False uses linear-space scan
+    # Ablation flags to test what makes TransformerCSSM work
+    asymmetric_qk: bool = False      # If True, use separate weights for Q→K and K→Q
+    no_feedback: bool = False        # If True, remove A→Q feedback (alpha = 0)
+    no_spectral_clip: bool = False   # If True, skip spectral magnitude clipping
+    use_layernorm: bool = False      # If True, add log-space LayerNorm before output
+    no_k_state: bool = False         # If True, drop K entirely → 2×2 Q+A scan
     # Unused but kept for API compatibility
     gate_activation: str = 'sigmoid'
     concat_xy: bool = True
@@ -2585,7 +1434,91 @@ class TransformerCSSM(nn.Module):
                                            (pad_w, max(0, pad_w_after))), mode='constant')
 
         K_hat_raw = jnp.fft.rfft2(k_padded, axes=(1, 2))
-        K_hat = _stable_spectral_magnitude(K_hat_raw, rho=self.spectral_rho)
+        # Ablation: no_spectral_clip - skip magnitude bounding
+        if self.no_spectral_clip:
+            K_hat = K_hat_raw
+        else:
+            K_hat = _stable_spectral_magnitude(K_hat_raw, rho=self.spectral_rho)
+
+        # === Shared gate context ===
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        K_b = K_hat[None, None, ...].astype(jnp.complex64)
+        ones = jnp.ones_like(K_b)
+
+        # =====================================================================
+        # no_k_state: Lean 2×2 Q+A scan (drop K entirely)
+        # =====================================================================
+        if self.no_k_state:
+            # --- Project input to Q, A pathways only ---
+            x_flat = x.reshape(B * T, H, W, C)
+            qa_proj = nn.Dense(2 * C, name='input_proj')(x_flat)
+            qa_proj = qa_proj.reshape(B, T, H, W, 2 * C)
+
+            q_input = qa_proj[..., :C]
+            a_input = qa_proj[..., C:]
+
+            U_Q_hat = jnp.fft.rfft2(q_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+            U_A_hat = jnp.fft.rfft2(a_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+            # --- Gates (7 total: decay_Q, decay_A, alpha, gamma, B_Q, B_A, C_gate) ---
+            decay_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_Q')(ctx)).reshape(B, T, 1, H, W_freq)
+            decay_A = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_A')(ctx)).reshape(B, T, 1, H, W_freq)
+            alpha = nn.sigmoid(nn.Dense(n_gate, name='alpha')(ctx)).reshape(B, T, 1, H, W_freq)
+            gamma = nn.sigmoid(nn.Dense(n_gate, name='gamma')(ctx)).reshape(B, T, 1, H, W_freq)
+            B_Q = nn.sigmoid(nn.Dense(n_gate, name='B_Q')(ctx)).reshape(B, T, 1, H, W_freq)
+            B_A = nn.sigmoid(nn.Dense(n_gate, name='B_A')(ctx)).reshape(B, T, 1, H, W_freq)
+            C_gate = nn.sigmoid(nn.Dense(n_gate, name='C_gate')(ctx)).reshape(B, T, 1, H, W_freq)
+
+            # --- Build 2×2 transition matrix ---
+            # [decay_Q    α·K ]   Q: self-decay + A→Q feedback via kernel
+            # [  γ      decay_A]   A: accumulates Q + self-decay (no kernel)
+            decay_Q_c = decay_Q.astype(jnp.complex64)
+            decay_A_c = decay_A.astype(jnp.complex64)
+
+            A_00 = decay_Q_c * ones      # Q self-decay
+            A_01 = alpha * K_b           # A → Q via kernel (the feedback!)
+            A_10 = gamma * ones          # Q → A (scalar, no kernel)
+            A_11 = decay_A_c * ones      # A self-decay
+
+            row0 = jnp.stack([A_00, A_01], axis=-1)
+            row1 = jnp.stack([A_10, A_11], axis=-1)
+            K_mat = jnp.stack([row0, row1], axis=-2)  # (B, T, C, H, W_freq, 2, 2)
+
+            U_Q_gated = U_Q_hat * B_Q
+            U_A_gated = U_A_hat * B_A
+            U_vec = jnp.stack([U_Q_gated, U_A_gated], axis=-1)  # (B, T, C, H, W_freq, 2)
+
+            # --- GOOM scan (2×2) ---
+            K_log = to_goom(K_mat)
+            U_log = to_goom(U_vec)
+
+            _, State_log = jax.lax.associative_scan(
+                cssm_matrix_scan_op, (K_log, U_log), axis=1
+            )
+
+            QA_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 2)
+            QA_hat_gated = QA_hat * C_gate[..., None]
+
+            # --- Output: Q+A readout ---
+            QA_hat_gated = QA_hat_gated.transpose(0, 1, 2, 5, 3, 4)
+            QA_hat_gated = QA_hat_gated.reshape(B, T, C * 2, H, -1)
+
+            out = jnp.fft.irfft2(QA_hat_gated, s=(H, W), axes=(3, 4))
+            out = out.transpose(0, 1, 3, 4, 2)
+            if self.pre_output_act == 'gelu':
+                out = jax.nn.gelu(out)
+            elif self.pre_output_act == 'silu':
+                out = jax.nn.silu(out)
+            return nn.Dense(C, name='output_proj')(out)
+
+        # =====================================================================
+        # Standard 3×3 Q+K+A scan
+        # =====================================================================
 
         # === Project input to Q, K, A pathways ===
         x_flat = x.reshape(B * T, H, W, C)
@@ -2601,25 +1534,28 @@ class TransformerCSSM(nn.Module):
         U_K_hat = jnp.fft.rfft2(k_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
         U_A_hat = jnp.fft.rfft2(a_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
 
-        # === Input-dependent gates (MINIMAL set) ===
-        # Use raw input (before position encoding) for gates if position_independent_gates is True
-        # This makes gates invariant to sequence position, improving length generalization
-        gate_input = x_raw if x_raw is not None else x
-        ctx = gate_input.mean(axis=(2, 3))
-        if x_raw is None:  # Only apply temporal RoPE to context if using position-encoded input
-            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
-        n_gate = H * W_freq
-
+        # === Input-dependent gates ===
         # 3 decay gates (bounded 0.1-0.99)
         decay_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_Q')(ctx)).reshape(B, T, 1, H, W_freq)
         decay_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_K')(ctx)).reshape(B, T, 1, H, W_freq)
         decay_A = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_A')(ctx)).reshape(B, T, 1, H, W_freq)
 
-        # Q↔K coupling (single weight, symmetric)
-        w_qk = nn.sigmoid(nn.Dense(n_gate, name='w_qk')(ctx)).reshape(B, T, 1, H, W_freq)
+        # Q↔K coupling
+        # Ablation: asymmetric_qk - use separate weights for each direction
+        if self.asymmetric_qk:
+            w_k_to_q = nn.sigmoid(nn.Dense(n_gate, name='w_k_to_q')(ctx)).reshape(B, T, 1, H, W_freq)
+            w_q_to_k = nn.sigmoid(nn.Dense(n_gate, name='w_q_to_k')(ctx)).reshape(B, T, 1, H, W_freq)
+        else:
+            w_qk = nn.sigmoid(nn.Dense(n_gate, name='w_qk')(ctx)).reshape(B, T, 1, H, W_freq)
+            w_k_to_q = w_qk  # Same weight for both directions (symmetric)
+            w_q_to_k = w_qk
 
         # A→Q feedback (attention application)
-        alpha = nn.sigmoid(nn.Dense(n_gate, name='alpha')(ctx)).reshape(B, T, 1, H, W_freq)
+        # Ablation: no_feedback - disable A→Q path
+        if self.no_feedback:
+            alpha = jnp.zeros((B, T, 1, H, W_freq))
+        else:
+            alpha = nn.sigmoid(nn.Dense(n_gate, name='alpha')(ctx)).reshape(B, T, 1, H, W_freq)
 
         # A accumulation rate (same for Q and K contribution)
         gamma = nn.sigmoid(nn.Dense(n_gate, name='gamma')(ctx)).reshape(B, T, 1, H, W_freq)
@@ -2635,8 +1571,6 @@ class TransformerCSSM(nn.Module):
         # [w·K        decay_K    0    ]   K: sees Q through kernel (symmetric)
         # [γ          γ        decay_A]   A: pure memory, no kernel
 
-        K_b = K_hat[None, None, ...].astype(jnp.complex64)
-        ones = jnp.ones_like(K_b)
         zeros = jnp.zeros_like(decay_Q.astype(jnp.complex64) * ones)
 
         decay_Q_c = decay_Q.astype(jnp.complex64)
@@ -2645,11 +1579,11 @@ class TransformerCSSM(nn.Module):
 
         # Row 0: Q update
         A_00 = decay_Q_c * ones           # Q self-decay (scalar, no kernel)
-        A_01 = w_qk * K_b                 # K → Q via kernel
+        A_01 = w_k_to_q * K_b             # K → Q via kernel
         A_02 = alpha * K_b                # A → Q via kernel (attention application!)
 
-        # Row 1: K update (symmetric with Q)
-        A_10 = w_qk * K_b                 # Q → K via kernel (same weight as K→Q)
+        # Row 1: K update
+        A_10 = w_q_to_k * K_b             # Q → K via kernel (same as K→Q if symmetric)
         A_11 = decay_K_c * ones           # K self-decay (scalar)
         A_12 = zeros                      # No A → K
 
@@ -2669,35 +1603,39 @@ class TransformerCSSM(nn.Module):
         U_A_gated = U_A_hat * B_A
         U_vec = jnp.stack([U_Q_gated, U_K_gated, U_A_gated], axis=-1)
 
-        # === Associative scan ===
-        if self.use_goom:
-            # GOOM (log-space) scan for numerical stability
-            from .math import cssm_3x3_matrix_scan_op
+        # === GOOM scan ===
+        from .math import cssm_3x3_matrix_scan_op
 
-            K_log = to_goom(K_mat)
-            U_log = to_goom(U_vec)
+        K_log = to_goom(K_mat)
+        U_log = to_goom(U_vec)
 
-            _, State_log = jax.lax.associative_scan(
-                cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
-            )
+        _, State_log = jax.lax.associative_scan(
+            cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
+        )
 
-            QKA_hat = from_goom(State_log)
+        # Ablation: use_layernorm - apply LayerNorm in log-space before exp
+        if self.use_layernorm:
+            # LayerNorm parameters for each state
+            ln_gamma = self.param('ln_gamma', nn.initializers.ones, (C, 1, 1, 3))
+            ln_beta = self.param('ln_beta', nn.initializers.zeros, (C, 1, 1, 3))
+
+            # State_log shape: (B, T, C, H, W_freq, 3)
+            log_real = State_log.real
+            log_imag = State_log.imag
+
+            # LayerNorm over spatial frequencies (axes 3, 4 = H, W_freq)
+            mean = log_real.mean(axis=(3, 4), keepdims=True)
+            std = log_real.std(axis=(3, 4), keepdims=True) + 1e-6
+            log_normalized = (log_real - mean) / std
+
+            # Apply learnable scale and shift
+            # ln_gamma/ln_beta: (C, 1, 1, 3) broadcast to (B, T, C, H, W_freq, 3)
+            log_scaled = ln_gamma[None, None, :, :, :, :] * log_normalized + ln_beta[None, None, :, :, :, :]
+
+            # Reconstruct complex and exp
+            QKA_hat = jnp.exp(log_scaled + 1j * log_imag)
         else:
-            # Linear-space scan (no GOOM) - may have numerical issues for long sequences
-            def linear_scan_op(carry_i, carry_j):
-                """Linear-space 3x3 matrix scan operator."""
-                K_i, u_i = carry_i
-                K_j, u_j = carry_j
-                # K_new = K_j @ K_i (3x3 matmul at each spatial position)
-                K_new = jnp.einsum('...ik,...kj->...ij', K_j, K_i)
-                # u_new = K_j @ u_i + u_j (3x3 matvec + add)
-                Ku_i = jnp.einsum('...ik,...k->...i', K_j, u_i)
-                u_new = Ku_i + u_j
-                return K_new, u_new
-
-            _, QKA_hat = jax.lax.associative_scan(
-                linear_scan_op, (K_mat, U_vec), axis=1
-            )
+            QKA_hat = from_goom(State_log)
 
         QKA_hat_gated = QKA_hat * C_gate[..., None]
 
@@ -2741,3 +1679,1763 @@ class TransformerCSSM(nn.Module):
             elif self.pre_output_act == 'silu':
                 out = jax.nn.silu(out)
             return nn.Dense(C, name='output_proj')(out)
+
+
+# =============================================================================
+# Multiplicative TransformerCSSM - Bilinear QKV with hGRU-style Spreading
+# =============================================================================
+
+class MultiplicativeTransformerCSSM(nn.Module):
+    """
+    Bilinear QKV Attention with hGRU-style Spreading (Simplified).
+
+    A recurrent attention mechanism that captures the hGRU bilinear circuit
+    in a QKV framework. **Simplified design**: kernels baked into diagonal of A,
+    no separate bias vector.
+
+    ============================================================================
+    KEY FEATURES
+    ============================================================================
+
+    1. **3 Recurrent States**: Q, K, V (all evolve over time)
+    2. **Each state spreads with its own kernel**: Q×W_Q, K×W_K, V×W_V
+    3. **Cross-state contributions are direct**: Q→V and K→V have no extra convolution
+    4. **Mamba-style input-dependent gates**: All 7 non-zero entries predicted from context
+    5. **Uses existing `cssm_3x3_matrix_scan_op`**: Simple 2-tuple scan (A, b)
+
+    ============================================================================
+    KEY SIMPLIFICATION
+    ============================================================================
+
+    **Old design**: Separate bias vector c for kernels → complex 3-tuple scan
+    **New design**: Kernels baked into diagonal of A → simpler 2-tuple scan (A, b)
+
+    ============================================================================
+    DYNAMICS
+    ============================================================================
+
+    Original Space (What We Compute):
+        Q_new = (d_Q × W_Q × Q) + (d_K→Q × K) + U_Q
+        K_new = (d_Q→K × Q) + (d_K × W_K × K) + U_K
+        V_new = (d_Q→V × Q) + (d_K→V × K) + (d_V × W_V × V) + U_V
+
+    Key insight:
+    - **Diagonal terms** (self-recurrence): decay × kernel × state → state spreads spatially
+    - **Off-diagonal terms** (cross-coupling): weight × state → direct contribution, no extra conv
+    - **Input terms**: added via logsumexp
+
+    ============================================================================
+    TRANSITION MATRIX A (Kernels on Diagonal)
+    ============================================================================
+
+    In log-space:
+    - Diagonal: `log(d × W) = log(d) + log(W)` — decay AND kernel combined
+    - Off-diagonal: `log(d)` only — just the coupling weight
+    - `-∞` entries: no V→Q or V→K feedback
+
+                    q                    k                    v
+    A = q  [ log(d_Q × W_Q)      log(d_K→Q)           -∞           ]
+        k  [ log(d_Q→K)          log(d_K × W_K)       -∞           ]
+        v  [ log(d_Q→V)          log(d_K→V)       log(d_V × W_V)   ]
+             ↑                    ↑                    ↑
+          kernel on diagonal    no kernel           kernel on diagonal
+
+    ============================================================================
+    UPDATE RULE
+    ============================================================================
+
+    Simple 2-tuple scan (no separate bias c):
+        x_t = logsumexp(A @ x_{t-1}, b_t)
+
+    Where:
+    - `A @ x` in log-space: `(A @ x)_i = logsumexp_j(A[i,j] + x[j])`
+    - `b_t` = input vector `[log_U_Q, log_U_K, log_U_V]`
+    - Final logsumexp adds input (addition in original space)
+
+    ============================================================================
+    hGRU MAPPING
+    ============================================================================
+
+    | Component           | Behavior                                    |
+    |---------------------|---------------------------------------------|
+    | Q spreads via W_Q   | Q's receptive field grows over time         |
+    | K spreads via W_K   | K's receptive field grows over time         |
+    | Q + K → V (direct)  | Where Q and K meet, signal flows to V       |
+    | V spreads via W_V   | V accumulates and spreads the attention sig |
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size for lateral connections
+        use_goom: If True, use complex log to handle negative values (GELU-friendly)
+        rope_mode: Position encoding mode
+        position_independent_gates: Compute gates from raw input for length generalization
+    """
+    channels: int
+    kernel_size: int = 11
+    use_goom: bool = True  # Handle negative values via complex phase
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    readout_state: str = 'v'  # 'v' for V output (attention-accumulated values)
+    pre_output_act: str = 'none'
+    position_independent_gates: bool = False  # Compute gates from raw input for length generalization
+    # Unused but kept for API compatibility
+    spectral_rho: float = 0.999
+    block_size: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with bilinear QKV dynamics using 2-tuple scan.
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        from .math import cssm_3x3_matrix_scan_op
+
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
+        # Optional position encoding
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # =====================================================================
+        # 1. THREE SPATIAL KERNELS (W_Q, W_K, W_V)
+        # =====================================================================
+        k_shape = (C, self.kernel_size, self.kernel_size)
+        kernel_q = self.param('kernel_q', nn.initializers.xavier_normal(), k_shape)
+        kernel_k = self.param('kernel_k', nn.initializers.xavier_normal(), k_shape)
+        kernel_v = self.param('kernel_v', nn.initializers.xavier_normal(), k_shape)
+
+        def pad_kernel(k_spatial):
+            """Pad kernel to input size for FFT."""
+            pad_h = max(0, (H - self.kernel_size) // 2)
+            pad_w = max(0, (W - self.kernel_size) // 2)
+            pad_h_after = H - self.kernel_size - pad_h
+            pad_w_after = W - self.kernel_size - pad_w
+
+            if self.kernel_size > H or self.kernel_size > W:
+                start_h = (self.kernel_size - H) // 2
+                start_w = (self.kernel_size - W) // 2
+                return k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+            else:
+                return jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        def kernel_to_log_spectral(kernel):
+            """FFT kernel and convert to log-spectral representation."""
+            k_padded = pad_kernel(kernel)
+            k_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
+            if self.use_goom:
+                return jnp.log(jnp.abs(k_hat) + 1e-8) + 1j * jnp.angle(k_hat)
+            else:
+                return jnp.log(jnp.abs(k_hat) + 1e-8)
+
+        log_W_Q = kernel_to_log_spectral(kernel_q)  # (C, H, W_freq)
+        log_W_K = kernel_to_log_spectral(kernel_k)
+        log_W_V = kernel_to_log_spectral(kernel_v)
+
+        # =====================================================================
+        # 2. PROJECT INPUT TO Q, K, V PATHWAYS
+        # =====================================================================
+        x_flat = x.reshape(B * T, H, W, C)
+        qkv_proj = nn.Dense(3 * C, name='qkv_proj')(x_flat)
+        qkv_proj = qkv_proj.reshape(B, T, H, W, 3 * C)
+
+        q_in = qkv_proj[..., :C]
+        k_in = qkv_proj[..., C:2*C]
+        v_in = qkv_proj[..., 2*C:]
+
+        def to_log_spectral(y):
+            """Convert spatial input to log-spectral representation."""
+            y_transposed = y.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
+            y_hat = jnp.fft.rfft2(y_transposed, axes=(3, 4))  # (B, T, C, H, W_freq)
+            if self.use_goom:
+                return jnp.log(jnp.abs(y_hat) + 1e-8) + 1j * jnp.angle(y_hat)
+            else:
+                return jnp.log(jnp.abs(y_hat) + 1e-8)
+
+        log_U_Q = to_log_spectral(q_in)
+        log_U_K = to_log_spectral(k_in)
+        log_U_V = to_log_spectral(v_in)
+
+        # =====================================================================
+        # 3. INPUT-DEPENDENT GATES (Mamba-style, ALL 7 non-zero entries)
+        # =====================================================================
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C) - spatial average for context
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        # Self-decay exponents (diagonal, bounded 0.1-0.99 for stability)
+        d_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_Q')(ctx))
+        d_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_K')(ctx))
+        d_V = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_V')(ctx))
+
+        # Q↔K cross-coupling (bilinear gating strength, 0-1)
+        d_K_to_Q = nn.sigmoid(nn.Dense(n_gate, name='d_K_to_Q')(ctx))  # K gates Q
+        d_Q_to_K = nn.sigmoid(nn.Dense(n_gate, name='d_Q_to_K')(ctx))  # Q gates K
+
+        # Attention flow to V (how much Q and K contribute to V, 0-1)
+        d_Q_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_Q_to_V')(ctx))  # Q → V
+        d_K_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_K_to_V')(ctx))  # K → V
+
+        # Reshape all for broadcasting: (B, T, 1, H, W_freq)
+        d_Q = d_Q.reshape(B, T, 1, H, W_freq)
+        d_K = d_K.reshape(B, T, 1, H, W_freq)
+        d_V = d_V.reshape(B, T, 1, H, W_freq)
+        d_K_to_Q = d_K_to_Q.reshape(B, T, 1, H, W_freq)
+        d_Q_to_K = d_Q_to_K.reshape(B, T, 1, H, W_freq)
+        d_Q_to_V = d_Q_to_V.reshape(B, T, 1, H, W_freq)
+        d_K_to_V = d_K_to_V.reshape(B, T, 1, H, W_freq)
+
+        # =====================================================================
+        # 4. BUILD TRANSITION MATRIX A (KERNELS ON DIAGONAL)
+        # =====================================================================
+        # Diagonal entries: decay × kernel (combined)
+        # log(d × W) = log(d) + log(W)
+        dtype = jnp.complex64 if self.use_goom else jnp.float32
+
+        # Expand kernels for broadcasting: (C, H, W_freq) -> (1, 1, C, H, W_freq)
+        log_W_Q_exp = log_W_Q[None, None, :, :, :]
+        log_W_K_exp = log_W_K[None, None, :, :, :]
+        log_W_V_exp = log_W_V[None, None, :, :, :]
+
+        # Diagonal: log(decay) + log(kernel) — decay AND kernel combined
+        log_diag_Q = jnp.log(d_Q + 1e-8) + log_W_Q_exp  # d_Q × W_Q
+        log_diag_K = jnp.log(d_K + 1e-8) + log_W_K_exp  # d_K × W_K
+        log_diag_V = jnp.log(d_V + 1e-8) + log_W_V_exp  # d_V × W_V
+
+        # Off-diagonal entries: coupling weight only (NO kernel)
+        log_d_K_to_Q = jnp.log(d_K_to_Q + 1e-8)
+        log_d_Q_to_K = jnp.log(d_Q_to_K + 1e-8)
+        log_d_Q_to_V = jnp.log(d_Q_to_V + 1e-8)
+        log_d_K_to_V = jnp.log(d_K_to_V + 1e-8)
+
+        # Convert to complex for GOOM if needed
+        if self.use_goom:
+            log_diag_Q = log_diag_Q.astype(jnp.complex64)
+            log_diag_K = log_diag_K.astype(jnp.complex64)
+            log_diag_V = log_diag_V.astype(jnp.complex64)
+            log_d_K_to_Q = log_d_K_to_Q.astype(jnp.complex64)
+            log_d_Q_to_K = log_d_Q_to_K.astype(jnp.complex64)
+            log_d_Q_to_V = log_d_Q_to_V.astype(jnp.complex64)
+            log_d_K_to_V = log_d_K_to_V.astype(jnp.complex64)
+
+        # -inf in log-space = 0 coefficient in original space (no V→Q or V→K feedback)
+        neg_inf = jnp.full((B, T, C, H, W_freq), -1e8, dtype=dtype)
+
+        #                q                    k                    v
+        # q  [ log(d_Q × W_Q)      log(d_K→Q)           -∞           ]
+        # k  [ log(d_Q→K)          log(d_K × W_K)       -∞           ]
+        # v  [ log(d_Q→V)          log(d_K→V)       log(d_V × W_V)   ]
+        #      ↑                    ↑                    ↑
+        #   kernel on diagonal    no kernel           kernel on diagonal
+
+        # Broadcast all to (B, T, C, H, W_freq)
+        ones_shape = jnp.ones((B, T, C, H, W_freq), dtype=dtype)
+        log_diag_Q_bc = log_diag_Q * ones_shape
+        log_diag_K_bc = log_diag_K * ones_shape
+        log_diag_V_bc = log_diag_V * ones_shape
+        log_d_K_to_Q_bc = log_d_K_to_Q * ones_shape
+        log_d_Q_to_K_bc = log_d_Q_to_K * ones_shape
+        log_d_Q_to_V_bc = log_d_Q_to_V * ones_shape
+        log_d_K_to_V_bc = log_d_K_to_V * ones_shape
+
+        row_q = jnp.stack([log_diag_Q_bc, log_d_K_to_Q_bc, neg_inf], axis=-1)
+        row_k = jnp.stack([log_d_Q_to_K_bc, log_diag_K_bc, neg_inf], axis=-1)
+        row_v = jnp.stack([log_d_Q_to_V_bc, log_d_K_to_V_bc, log_diag_V_bc], axis=-1)
+
+        A_mat = jnp.stack([row_q, row_k, row_v], axis=-2)  # (B, T, C, H, W_freq, 3, 3)
+
+        # =====================================================================
+        # 5. BUILD INPUT VECTOR b
+        # =====================================================================
+        b_vec = jnp.stack([log_U_Q, log_U_K, log_U_V], axis=-1)  # (B, T, C, H, W_freq, 3)
+
+        # =====================================================================
+        # 6. ASSOCIATIVE SCAN (2-tuple: A, b)
+        # =====================================================================
+        # Simple 2-tuple scan: x_t = logsumexp(A @ x_{t-1}, b_t)
+        # No separate bias c — kernels are baked into diagonal of A
+        _, state_log = jax.lax.associative_scan(
+            cssm_3x3_matrix_scan_op, (A_mat, b_vec), axis=1
+        )
+
+        # state_log shape: (B, T, C, H, W_freq, 3) where last dim is [Q, K, V]
+        log_Q = state_log[..., 0]  # (B, T, C, H, W_freq)
+        log_K = state_log[..., 1]
+        log_V = state_log[..., 2]
+
+        # =====================================================================
+        # 7. CONVERT TO SPATIAL AND OUTPUT
+        # =====================================================================
+        # LayerNorm in log-space for stability
+        ln_gamma_v = self.param('ln_gamma_v', nn.initializers.ones, (C, 1, 1))
+        ln_beta_v = self.param('ln_beta_v', nn.initializers.zeros, (C, 1, 1))
+
+        def from_log_spectral(log_state, ln_gamma, ln_beta):
+            """Convert log-spectral back to spatial domain with LayerNorm."""
+            if self.use_goom:
+                log_real = log_state.real
+            else:
+                log_real = log_state
+
+            # LayerNorm over spatial frequencies (axes 3, 4 = H, W_freq)
+            mean = log_real.mean(axis=(-2, -1), keepdims=True)
+            std = log_real.std(axis=(-2, -1), keepdims=True) + 1e-6
+
+            if self.use_goom:
+                log_normalized = (log_state.real - mean) / std + 1j * log_state.imag
+            else:
+                log_normalized = (log_state - mean) / std
+
+            # Learnable scale and shift
+            log_scaled = ln_gamma[None, None, :, :, :] * log_normalized + ln_beta[None, None, :, :, :]
+
+            # Now exp is safe (values centered around 0)
+            state_hat = jnp.exp(log_scaled)
+
+            # iFFT back to spatial
+            return jnp.fft.irfft2(state_hat, s=(H, W), axes=(3, 4))
+
+        # V is the output (accumulated attention-weighted values)
+        V_spatial = from_log_spectral(log_V, ln_gamma_v, ln_beta_v)  # (B, T, C, H, W)
+
+        # Optional pre-output activation
+        if self.pre_output_act == 'gelu':
+            V_spatial = jax.nn.gelu(V_spatial)
+        elif self.pre_output_act == 'silu':
+            V_spatial = jax.nn.silu(V_spatial)
+
+        # Transpose and project
+        output = V_spatial.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        return nn.Dense(C, name='output_proj')(output)
+
+
+class GrowingTransformerCSSM(nn.Module):
+    """
+    Growing Attention Transformer with two-stage Q→[K,V] architecture.
+
+    ============================================================================
+    KEY FEATURES
+    ============================================================================
+
+    1. **Two-stage approach**: Q computed first (scalar scan), then [K, V] together
+    2. **Triangular scan**: K→V flow, no V→K feedback (preserves associativity)
+    3. **Growing attention**: V accumulates Q·K weighted signal over time
+    4. **GOOM**: Uses to_goom/from_goom with custom VJP for gradient stability
+    5. **Always spectral clip**: Kernels bounded by rho for dynamic stability
+    6. **No LayerNorm**: Direct from_goom output (confirmed better)
+
+    ============================================================================
+    DYNAMICS
+    ============================================================================
+
+    **Stage 1: Q Scan (Independent)**
+
+        Q_t = d_Q · W_Q · Q_{t-1} + B_Q · U_Q
+
+    **Stage 2: [K, V] Triangular Scan**
+
+        [K_t]   [ d_K·Q·W_K       0        ] [K_{t-1}]   [ B_K·Q·U_K ]
+        [V_t] = [ Q·w_KV      d_V·W_V      ] [V_{t-1}] + [ B_V·U_V   ]
+
+    ============================================================================
+    GATES (9 total)
+    ============================================================================
+
+    | Gate | Range | Role |
+    |------|-------|------|
+    | d_Q | 0.1-0.99 | Q self-decay |
+    | d_K | 0.1-0.99 | K self-decay |
+    | d_V | 0.1-0.99 | V self-decay |
+    | w_KV | 0-1 | K→V attention weight |
+    | B_Q | 0-1 | Q input gate |
+    | B_K | 0-1 | K input gate |
+    | B_V | 0-1 | V input gate |
+    | C_gate | 0-1 | Output gate |
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size for lateral connections
+        rope_mode: Position encoding mode
+        position_independent_gates: Compute gates from raw input for length generalization
+    """
+    channels: int
+    kernel_size: int = 11
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    position_independent_gates: bool = False
+    spectral_rho: float = 0.999
+    block_size: int = 1
+    # Ablation flags
+    shared_kernel: bool = False      # Use 1 kernel for Q/K/V
+    additive_kv: bool = False        # Additive Q→V + K→V instead of Q·K→V
+    # Legacy flags (ignored, kept for API compat)
+    use_goom: bool = True
+    spectral_clip: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with two-stage Q→[K,V] dynamics.
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
+        # Optional position encoding
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # =====================================================================
+        # 1. SPATIAL KERNELS — always spectral clipped
+        # =====================================================================
+        k_shape = (C, self.kernel_size, self.kernel_size)
+
+        def pad_kernel(k_spatial):
+            pad_h = max(0, (H - self.kernel_size) // 2)
+            pad_w = max(0, (W - self.kernel_size) // 2)
+            pad_h_after = H - self.kernel_size - pad_h
+            pad_w_after = W - self.kernel_size - pad_w
+            if self.kernel_size > H or self.kernel_size > W:
+                start_h = (self.kernel_size - H) // 2
+                start_w = (self.kernel_size - W) // 2
+                return k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+            else:
+                return jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        def kernel_to_spectral(kernel):
+            """FFT kernel with spectral clipping (always on)."""
+            k_padded = pad_kernel(kernel)
+            k_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))
+            return _stable_spectral_magnitude(k_hat, rho=self.spectral_rho)
+
+        if self.shared_kernel:
+            kernel_shared = self.param('kernel', nn.initializers.xavier_normal(), k_shape)
+            K_hat_shared = kernel_to_spectral(kernel_shared)
+            K_hat_Q = K_hat_shared
+            K_hat_K = K_hat_shared
+            K_hat_V = K_hat_shared
+        else:
+            kernel_q = self.param('kernel_q', nn.initializers.xavier_normal(), k_shape)
+            kernel_k = self.param('kernel_k', nn.initializers.xavier_normal(), k_shape)
+            kernel_v = self.param('kernel_v', nn.initializers.xavier_normal(), k_shape)
+            K_hat_Q = kernel_to_spectral(kernel_q)  # (C, H, W_freq)
+            K_hat_K = kernel_to_spectral(kernel_k)
+            K_hat_V = kernel_to_spectral(kernel_v)
+
+        # Broadcast kernels: (C, H, W_freq) -> (1, 1, C, H, W_freq)
+        K_b_Q = K_hat_Q[None, None, ...].astype(jnp.complex64)
+        K_b_K = K_hat_K[None, None, ...].astype(jnp.complex64)
+        K_b_V = K_hat_V[None, None, ...].astype(jnp.complex64)
+
+        # =====================================================================
+        # 2. PROJECT INPUT TO Q, K, V PATHWAYS
+        # =====================================================================
+        x_flat = x.reshape(B * T, H, W, C)
+        qkv_proj = nn.Dense(3 * C, name='qkv_proj')(x_flat)
+        qkv_proj = qkv_proj.reshape(B, T, H, W, 3 * C)
+
+        q_in = qkv_proj[..., :C]
+        k_in = qkv_proj[..., C:2*C]
+        v_in = qkv_proj[..., 2*C:]
+
+        # Spectral domain (linear space, NOT log)
+        U_Q_hat = jnp.fft.rfft2(q_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        U_K_hat = jnp.fft.rfft2(k_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        U_V_hat = jnp.fft.rfft2(v_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+        # =====================================================================
+        # 3. INPUT-DEPENDENT GATES
+        # =====================================================================
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        d_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_Q')(ctx))
+        d_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_K')(ctx))
+        d_V = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_V')(ctx))
+
+        if self.additive_kv:
+            d_Q_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_Q_to_V')(ctx))
+            d_K_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_K_to_V')(ctx))
+            d_Q_to_V = d_Q_to_V.reshape(B, T, 1, H, W_freq)
+            d_K_to_V = d_K_to_V.reshape(B, T, 1, H, W_freq)
+            w_KV = None
+        else:
+            w_KV = nn.sigmoid(nn.Dense(n_gate, name='w_KV')(ctx))
+            w_KV = w_KV.reshape(B, T, 1, H, W_freq)
+            d_Q_to_V = None
+            d_K_to_V = None
+
+        # I/O gates
+        B_Q = nn.sigmoid(nn.Dense(n_gate, name='B_Q')(ctx))
+        B_K = nn.sigmoid(nn.Dense(n_gate, name='B_K')(ctx))
+        B_V = nn.sigmoid(nn.Dense(n_gate, name='B_V')(ctx))
+        C_gate = nn.sigmoid(nn.Dense(n_gate, name='C_gate')(ctx))
+
+        # Reshape for broadcasting: (B, T, 1, H, W_freq)
+        d_Q = d_Q.reshape(B, T, 1, H, W_freq)
+        d_K = d_K.reshape(B, T, 1, H, W_freq)
+        d_V = d_V.reshape(B, T, 1, H, W_freq)
+        B_Q = B_Q.reshape(B, T, 1, H, W_freq)
+        B_K = B_K.reshape(B, T, 1, H, W_freq)
+        B_V = B_V.reshape(B, T, 1, H, W_freq)
+        C_gate = C_gate.reshape(B, T, 1, H, W_freq)
+
+        # =====================================================================
+        # 4. STAGE 1: Q SCAN (scalar, linear space → GOOM)
+        # =====================================================================
+        # Q_t = d_Q · W_Q · Q_{t-1} + B_Q · U_Q
+        d_Q_c = d_Q.astype(jnp.complex64)
+        A_Q = d_Q_c * K_b_Q              # (B, T, C, H, W_freq) linear space
+        U_Q_gated = U_Q_hat * B_Q        # Input with gate
+
+        A_Q_log = to_goom(A_Q)
+        U_Q_log = to_goom(U_Q_gated)
+
+        _, Q_log = jax.lax.associative_scan(
+            cssm_scalar_scan_op, (A_Q_log, U_Q_log), axis=1
+        )
+        Q_hat = from_goom(Q_log)  # (B, T, C, H, W_freq) back to linear
+
+        # =====================================================================
+        # 5. STAGE 2: [K, V] TRANSITION MATRIX (linear space, then to_goom)
+        # =====================================================================
+        #        K              V
+        # K [ d_K·Q·W_K        0       ]   K evolves, gated by Q
+        # V [ Q·w_KV       d_V·W_V     ]   V accumulates K, weighted by Q
+
+        d_K_c = d_K.astype(jnp.complex64)
+        d_V_c = d_V.astype(jnp.complex64)
+        zeros = jnp.zeros_like(d_K_c * K_b_K)
+
+        diag_K = d_K_c * Q_hat * K_b_K          # K self-decay × Q gating × K kernel
+        diag_V = d_V_c * K_b_V                  # V self-decay × V kernel
+
+        if self.additive_kv:
+            K_to_V = d_K_to_V.astype(jnp.complex64) * jnp.ones_like(K_b_K)
+        else:
+            K_to_V = Q_hat * w_KV               # Q-weighted K→V
+
+        row_K = jnp.stack([diag_K, zeros], axis=-1)
+        row_V = jnp.stack([K_to_V, diag_V], axis=-1)
+        K_mat = jnp.stack([row_K, row_V], axis=-2)
+
+        # Input vector with B gates
+        U_K_gated = U_K_hat * Q_hat * B_K       # K input gated by Q and B_K
+        if self.additive_kv:
+            U_V_gated = U_V_hat * B_V + d_Q_to_V * Q_hat
+        else:
+            U_V_gated = U_V_hat * B_V
+        U_vec = jnp.stack([U_K_gated, U_V_gated], axis=-1)
+
+        # GOOM scan
+        K_log = to_goom(K_mat)
+        U_log = to_goom(U_vec)
+
+        _, State_log = jax.lax.associative_scan(
+            cssm_matrix_scan_op, (K_log, U_log), axis=1
+        )
+
+        # Convert back via GOOM (no LayerNorm)
+        KV_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 2)
+        KV_hat_gated = KV_hat * C_gate[..., None]
+
+        # =====================================================================
+        # 6. CONVERT TO SPATIAL AND OUTPUT
+        # =====================================================================
+        V_hat = KV_hat_gated[..., 1]  # (B, T, C, H, W_freq)
+        V_spatial = jnp.fft.irfft2(V_hat, s=(H, W), axes=(3, 4))
+
+        output = V_spatial.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        return nn.Dense(C, name='output_proj')(output)
+
+
+class MambaGrowingTransformerCSSM(nn.Module):
+    """
+    Mamba-style Growing Attention Transformer with 3D conv Q and [K,V] triangular scan.
+
+    ============================================================================
+    KEY FEATURES
+    ============================================================================
+
+    1. **Mamba-style Q**: Q computed via causal 3D convolution (not scan)
+    2. **Single [K,V] triangular scan**: Only one scan needed (most efficient)
+    3. **Growing attention**: V accumulates Q·K weighted signal over time
+    4. **Hybrid**: Local Q (conv) + global K,V (scan)
+    5. **GOOM**: Uses to_goom/from_goom with custom VJP for gradient stability
+    6. **Always spectral clip**: Kernels bounded by rho for dynamic stability
+    7. **No LayerNorm**: Direct from_goom output (confirmed better)
+
+    ============================================================================
+    DYNAMICS
+    ============================================================================
+
+    **Q Computation (Causal 3D Conv)**
+
+        Q = GELU(Conv3D(input, kernel_size=(q_temporal, q_spatial, q_spatial)))
+
+    The 3D conv is causal in time (only looks at current + past frames).
+
+    **[K, V] Triangular Scan**
+
+        [K_t]   [ d_K·Q·W_K       0        ] [K_{t-1}]   [ B_K·Q·U_K ]
+        [V_t] = [ Q·w_KV      d_V·W_V      ] [V_{t-1}] + [ B_V·U_V   ]
+
+    ============================================================================
+    GATES (6 total)
+    ============================================================================
+
+    | Gate | Range | Role |
+    |------|-------|------|
+    | d_K | 0.1-0.99 | K self-decay |
+    | d_V | 0.1-0.99 | V self-decay |
+    | w_KV | 0-1 | K→V attention weight |
+    | B_K | 0-1 | K input gate |
+    | B_V | 0-1 | V input gate |
+    | C_gate | 0-1 | Output gate |
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size for K,V lateral connections
+        q_temporal: Temporal extent of Q conv (default 3)
+        q_spatial: Spatial extent of Q conv (default 5)
+        rope_mode: Position encoding mode
+        position_independent_gates: Compute gates from raw input for length generalization
+    """
+    channels: int
+    kernel_size: int = 11
+    q_temporal: int = 3   # Temporal extent of Q conv
+    q_spatial: int = 5    # Spatial extent of Q conv
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    position_independent_gates: bool = False
+    spectral_rho: float = 0.999
+    block_size: int = 1
+    # Ablation flags (kept for backward compat but use_goom/spectral_clip always on)
+    shared_kernel: bool = False      # Use 1 kernel for K/V
+    additive_kv: bool = False        # Additive Q→V + K→V instead of Q·K→V
+    # Legacy flags (ignored, kept for API compat)
+    use_goom: bool = True
+    spectral_clip: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with Mamba-style Q conv and [K,V] triangular scan.
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
+        # Optional position encoding
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # =====================================================================
+        # 1. Q COMPUTATION VIA CAUSAL 3D CONV (Mamba-style)
+        # =====================================================================
+        causal_pad_t = self.q_temporal - 1
+        spatial_pad = self.q_spatial // 2
+
+        x_padded = jnp.pad(
+            x,
+            ((0, 0),                          # batch
+             (causal_pad_t, 0),               # time: causal (only past)
+             (spatial_pad, spatial_pad),      # height: symmetric
+             (spatial_pad, spatial_pad),      # width: symmetric
+             (0, 0)),                         # channels
+            mode='constant'
+        )
+
+        q_kernel = self.param(
+            'q_conv_kernel',
+            nn.initializers.xavier_normal(),
+            (self.q_temporal, self.q_spatial, self.q_spatial, C, C)
+        )
+
+        Q_spatial = jax.lax.conv_general_dilated(
+            x_padded, q_kernel,
+            window_strides=(1, 1, 1),
+            padding='VALID',
+            dimension_numbers=('NTHWC', 'THWIO', 'NTHWC'),
+        )
+        Q_spatial = jax.nn.gelu(Q_spatial)  # (B, T, H, W, C)
+
+        # Q in spectral domain (linear space)
+        Q_hat = jnp.fft.rfft2(Q_spatial.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+        # =====================================================================
+        # 2. SPATIAL KERNELS (W_K, W_V) — always spectral clipped
+        # =====================================================================
+        k_shape = (C, self.kernel_size, self.kernel_size)
+
+        def pad_kernel(k_spatial):
+            pad_h = max(0, (H - self.kernel_size) // 2)
+            pad_w = max(0, (W - self.kernel_size) // 2)
+            pad_h_after = H - self.kernel_size - pad_h
+            pad_w_after = W - self.kernel_size - pad_w
+            if self.kernel_size > H or self.kernel_size > W:
+                start_h = (self.kernel_size - H) // 2
+                start_w = (self.kernel_size - W) // 2
+                return k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+            else:
+                return jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        def kernel_to_spectral(kernel):
+            """FFT kernel with spectral clipping (always on)."""
+            k_padded = pad_kernel(kernel)
+            k_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))
+            return _stable_spectral_magnitude(k_hat, rho=self.spectral_rho)
+
+        if self.shared_kernel:
+            kernel_shared = self.param('kernel', nn.initializers.xavier_normal(), k_shape)
+            K_hat_K = kernel_to_spectral(kernel_shared)
+            K_hat_V = K_hat_K
+        else:
+            kernel_k = self.param('kernel_k', nn.initializers.xavier_normal(), k_shape)
+            kernel_v = self.param('kernel_v', nn.initializers.xavier_normal(), k_shape)
+            K_hat_K = kernel_to_spectral(kernel_k)  # (C, H, W_freq)
+            K_hat_V = kernel_to_spectral(kernel_v)
+
+        # Broadcast kernels: (C, H, W_freq) -> (1, 1, C, H, W_freq)
+        K_b_K = K_hat_K[None, None, ...].astype(jnp.complex64)
+        K_b_V = K_hat_V[None, None, ...].astype(jnp.complex64)
+
+        # =====================================================================
+        # 3. PROJECT INPUT TO K, V PATHWAYS (Q already computed)
+        # =====================================================================
+        x_flat = x.reshape(B * T, H, W, C)
+        kv_proj = nn.Dense(2 * C, name='kv_proj')(x_flat)
+        kv_proj = kv_proj.reshape(B, T, H, W, 2 * C)
+
+        k_in = kv_proj[..., :C]
+        v_in = kv_proj[..., C:]
+
+        # Spectral domain (linear space, NOT log)
+        U_K_hat = jnp.fft.rfft2(k_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        U_V_hat = jnp.fft.rfft2(v_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+        # =====================================================================
+        # 4. INPUT-DEPENDENT GATES
+        # =====================================================================
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        d_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_K')(ctx))
+        d_V = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_V')(ctx))
+
+        if self.additive_kv:
+            d_Q_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_Q_to_V')(ctx))
+            d_K_to_V = nn.sigmoid(nn.Dense(n_gate, name='d_K_to_V')(ctx))
+            d_Q_to_V = d_Q_to_V.reshape(B, T, 1, H, W_freq)
+            d_K_to_V = d_K_to_V.reshape(B, T, 1, H, W_freq)
+            w_KV = None
+        else:
+            w_KV = nn.sigmoid(nn.Dense(n_gate, name='w_KV')(ctx))
+            w_KV = w_KV.reshape(B, T, 1, H, W_freq)
+            d_Q_to_V = None
+            d_K_to_V = None
+
+        # I/O gates
+        B_K = nn.sigmoid(nn.Dense(n_gate, name='B_K')(ctx))
+        B_V = nn.sigmoid(nn.Dense(n_gate, name='B_V')(ctx))
+        C_gate = nn.sigmoid(nn.Dense(n_gate, name='C_gate')(ctx))
+
+        # Reshape for broadcasting: (B, T, 1, H, W_freq)
+        d_K = d_K.reshape(B, T, 1, H, W_freq)
+        d_V = d_V.reshape(B, T, 1, H, W_freq)
+        B_K = B_K.reshape(B, T, 1, H, W_freq)
+        B_V = B_V.reshape(B, T, 1, H, W_freq)
+        C_gate = C_gate.reshape(B, T, 1, H, W_freq)
+
+        # =====================================================================
+        # 5. BUILD [K, V] TRANSITION MATRIX (linear space, then to_goom)
+        # =====================================================================
+        #        K              V
+        # K [ d_K·Q·W_K        0       ]   K evolves, gated by Q
+        # V [ Q·w_KV       d_V·W_V     ]   V accumulates K, weighted by Q
+
+        d_K_c = d_K.astype(jnp.complex64)
+        d_V_c = d_V.astype(jnp.complex64)
+        zeros = jnp.zeros_like(d_K_c * K_b_K)
+
+        # Diagonal entries (linear space)
+        diag_K = d_K_c * Q_hat * K_b_K          # K self-decay × Q gating × K kernel
+        diag_V = d_V_c * K_b_V                  # V self-decay × V kernel
+
+        # Off-diagonal: K→V flow
+        if self.additive_kv:
+            K_to_V = d_K_to_V.astype(jnp.complex64) * jnp.ones_like(K_b_K)
+        else:
+            K_to_V = Q_hat * w_KV               # Q-weighted K→V (attention-like)
+
+        row_K = jnp.stack([diag_K, zeros], axis=-1)
+        row_V = jnp.stack([K_to_V, diag_V], axis=-1)
+        K_mat = jnp.stack([row_K, row_V], axis=-2)
+
+        # Input vector with B gates
+        U_K_gated = U_K_hat * Q_hat * B_K       # K input gated by Q and B_K
+        if self.additive_kv:
+            U_V_gated = U_V_hat * B_V + d_Q_to_V * Q_hat  # V input + Q→V term
+        else:
+            U_V_gated = U_V_hat * B_V
+        U_vec = jnp.stack([U_K_gated, U_V_gated], axis=-1)
+
+        # GOOM scan
+        K_log = to_goom(K_mat)
+        U_log = to_goom(U_vec)
+
+        _, State_log = jax.lax.associative_scan(
+            cssm_matrix_scan_op, (K_log, U_log), axis=1
+        )
+
+        # Convert back via GOOM (no LayerNorm)
+        KV_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 2)
+        KV_hat_gated = KV_hat * C_gate[..., None]
+
+        # =====================================================================
+        # 6. CONVERT TO SPATIAL AND OUTPUT
+        # =====================================================================
+        V_hat = KV_hat_gated[..., 1]  # (B, T, C, H, W_freq)
+        V_spatial = jnp.fft.irfft2(V_hat, s=(H, W), axes=(3, 4))
+
+        output = V_spatial.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        return nn.Dense(C, name='output_proj')(output)
+
+
+class SpectralTransformerCSSM(nn.Module):
+    """
+    Spectral Transformer with correct spatial Q gating via spectral convolution.
+
+    ============================================================================
+    KEY DIFFERENCE FROM g_transformer
+    ============================================================================
+
+    **g_transformer (approximate):**
+        Computes Q_hat × W_K_hat × K_hat (element-wise in spectral)
+        = Q * W_K * K (cascade of convolutions in spatial)
+
+    **spectral_transformer (correct):**
+        Computes Q ⊙ (W_K * K) (element-wise Q gating AFTER convolution)
+        Requires: spectral_conv(Q_hat, W_K_hat × K_hat)
+                = FFT(IFFT(Q_hat) × IFFT(W_K_hat × K_hat))
+
+    ============================================================================
+    MATHEMATICAL BACKGROUND
+    ============================================================================
+
+    The convolution theorem states:
+    - FFT(a * b) = FFT(a) ⊙ FFT(b)  [convolution → element-wise]
+    - FFT(a ⊙ b) = FFT(a) ⊛ FFT(b)  [element-wise → convolution]
+
+    So when we want Q ⊙ (W_K * K) in spatial domain:
+    1. Compute W_K * K via spectral: W_K_hat ⊙ K_hat
+    2. IFFT to spatial: (W_K * K)_spatial
+    3. Multiply by Q_spatial element-wise
+    4. FFT back to spectral (if needed for next step)
+
+    ============================================================================
+    TRADEOFF
+    ============================================================================
+
+    | Approach | Parallelism | What it computes |
+    |----------|-------------|------------------|
+    | g_transformer | O(log T) associative | Q * W_K * K (convolutions) |
+    | spectral_transformer | O(T) sequential | Q ⊙ (W_K * K) (correct gating) |
+
+    The spectral_transformer uses a sequential scan (jax.lax.scan) instead of
+    associative_scan because the spatial gating operation doesn't compose
+    associatively in log-space.
+
+    ============================================================================
+    DYNAMICS
+    ============================================================================
+
+    **Stage 1: Q Scan (same as g_transformer)**
+        Q_t = d_Q × W_Q * Q_{t-1} + U_Q
+        (Uses associative scan in spectral space)
+
+    **Stage 2: [K, V] Sequential Scan with Spatial Q Gating**
+        K_spatial_t = Q_t ⊙ (d_K × W_K * K_{t-1}) + Q_t ⊙ U_K
+        V_spatial_t = Q_t ⊙ w_KV ⊙ K_t + d_V × W_V * V_{t-1} + U_V
+
+        Each step:
+        1. Apply decay and kernel in spectral: d × W_hat × state_hat
+        2. IFFT to spatial
+        3. Element-wise multiply by Q_spatial
+        4. Add input contribution
+        5. FFT back to spectral for next iteration
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size for lateral connections
+        use_goom: If True, use complex log for Q scan (handles negative values)
+        rope_mode: Position encoding mode
+        position_independent_gates: Compute gates from raw input
+        spectral_rho: Spectral magnitude clipping threshold
+    """
+    channels: int
+    kernel_size: int = 11
+    use_goom: bool = True
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    position_independent_gates: bool = False
+    spectral_rho: float = 0.999
+    block_size: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with correct spatial Q gating.
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
+        # Optional position encoding
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # =====================================================================
+        # 1. SPATIAL KERNELS (W_Q, W_K, W_V) with spectral clipping
+        # =====================================================================
+        k_shape = (C, self.kernel_size, self.kernel_size)
+        kernel_q = self.param('kernel_q', nn.initializers.xavier_normal(), k_shape)
+        kernel_k = self.param('kernel_k', nn.initializers.xavier_normal(), k_shape)
+        kernel_v = self.param('kernel_v', nn.initializers.xavier_normal(), k_shape)
+
+        def pad_kernel(k_spatial):
+            """Pad kernel to input size for FFT."""
+            pad_h = max(0, (H - self.kernel_size) // 2)
+            pad_w = max(0, (W - self.kernel_size) // 2)
+            pad_h_after = H - self.kernel_size - pad_h
+            pad_w_after = W - self.kernel_size - pad_w
+
+            if self.kernel_size > H or self.kernel_size > W:
+                start_h = (self.kernel_size - H) // 2
+                start_w = (self.kernel_size - W) // 2
+                return k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+            else:
+                return jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        # Get spectral kernels with stability clipping
+        W_Q_hat = _stable_spectral_magnitude(
+            jnp.fft.rfft2(pad_kernel(kernel_q), axes=(1, 2)), rho=self.spectral_rho
+        )  # (C, H, W_freq)
+        W_K_hat = _stable_spectral_magnitude(
+            jnp.fft.rfft2(pad_kernel(kernel_k), axes=(1, 2)), rho=self.spectral_rho
+        )
+        W_V_hat = _stable_spectral_magnitude(
+            jnp.fft.rfft2(pad_kernel(kernel_v), axes=(1, 2)), rho=self.spectral_rho
+        )
+
+        # =====================================================================
+        # 2. PROJECT INPUT TO Q, K, V PATHWAYS
+        # =====================================================================
+        x_flat = x.reshape(B * T, H, W, C)
+        qkv_proj = nn.Dense(3 * C, name='qkv_proj')(x_flat)
+        qkv_proj = qkv_proj.reshape(B, T, H, W, 3 * C)
+
+        q_in = qkv_proj[..., :C]
+        k_in = qkv_proj[..., C:2*C]
+        v_in = qkv_proj[..., 2*C:]
+
+        # Convert to spectral for Q scan
+        def to_spectral(y):
+            """Convert spatial to spectral."""
+            y_perm = y.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
+            return jnp.fft.rfft2(y_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
+
+        def to_log_spectral(y):
+            """Convert spatial to log-spectral (for GOOM)."""
+            y_hat = to_spectral(y)
+            if self.use_goom:
+                return jnp.log(jnp.abs(y_hat) + 1e-8) + 1j * jnp.angle(y_hat)
+            else:
+                return jnp.log(jnp.abs(y_hat) + 1e-8)
+
+        log_U_Q = to_log_spectral(q_in)  # (B, T, C, H, W_freq)
+        U_K = to_spectral(k_in)  # Keep in linear spectral for sequential scan
+        U_V = to_spectral(v_in)
+
+        # =====================================================================
+        # 3. INPUT-DEPENDENT GATES
+        # =====================================================================
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C)
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        # Self-decay exponents (bounded 0.1-0.99 for stability)
+        d_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_Q')(ctx))
+        d_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_K')(ctx))
+        d_V = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='d_V')(ctx))
+
+        # K→V attention weight (0-1)
+        w_KV = nn.sigmoid(nn.Dense(n_gate, name='w_KV')(ctx))
+
+        # Reshape for broadcasting: (B, T, 1, H, W_freq)
+        d_Q = d_Q.reshape(B, T, 1, H, W_freq)
+        d_K = d_K.reshape(B, T, 1, H, W_freq)
+        d_V = d_V.reshape(B, T, 1, H, W_freq)
+        w_KV = w_KV.reshape(B, T, 1, H, W_freq)
+
+        # =====================================================================
+        # 4. STAGE 1: Q SCAN (Associative scan in log-spectral space)
+        # =====================================================================
+        # Q_t = d_Q × W_Q * Q_{t-1} + U_Q
+        # This is the same as g_transformer - Q evolves independently
+
+        dtype = jnp.complex64 if self.use_goom else jnp.float32
+
+        # Convert kernel to log-spectral
+        if self.use_goom:
+            log_W_Q = jnp.log(jnp.abs(W_Q_hat) + 1e-8) + 1j * jnp.angle(W_Q_hat)
+        else:
+            log_W_Q = jnp.log(jnp.abs(W_Q_hat) + 1e-8)
+
+        log_W_Q_exp = log_W_Q[None, None, :, :, :]  # (1, 1, C, H, W_freq)
+
+        # Transition: log(decay × kernel)
+        log_A_Q = jnp.log(d_Q + 1e-8) + log_W_Q_exp
+        if self.use_goom:
+            log_A_Q = log_A_Q.astype(jnp.complex64)
+
+        # Run Q scan (associative)
+        _, log_Q = jax.lax.associative_scan(
+            cssm_scalar_scan_op, (log_A_Q, log_U_Q), axis=1
+        )
+        # log_Q shape: (B, T, C, H, W_freq)
+
+        # Convert Q to spatial for gating
+        if self.use_goom:
+            Q_hat = jnp.exp(log_Q.real) * jnp.exp(1j * log_Q.imag)
+        else:
+            Q_hat = jnp.exp(log_Q)
+        Q_spatial = jnp.fft.irfft2(Q_hat, s=(H, W), axes=(3, 4))  # (B, T, C, H, W)
+
+        # =====================================================================
+        # 5. STAGE 2: [K, V] SEQUENTIAL SCAN with SPATIAL Q GATING
+        # =====================================================================
+        # This is the key difference from g_transformer!
+        # We use jax.lax.scan (sequential) instead of associative_scan
+        # because spatial gating doesn't compose associatively.
+
+        # Expand kernels: (C, H, W_freq) -> (1, C, H, W_freq)
+        W_K_hat_exp = W_K_hat[None, :, :, :]
+        W_V_hat_exp = W_V_hat[None, :, :, :]
+
+        def sequential_step(carry, inputs):
+            """
+            One step of the [K, V] sequential recurrence.
+
+            Dynamics:
+                K_spatial_t = Q_t ⊙ (d_K × W_K * K_{t-1}) + Q_t ⊙ U_K_spatial
+                V_spatial_t = Q_t ⊙ w_KV ⊙ K_t + d_V × W_V * V_{t-1} + U_V_spatial
+
+            We keep K, V in spectral space between steps for efficiency,
+            only converting to spatial for the Q gating operation.
+            """
+            K_hat_prev, V_hat_prev = carry  # (B, C, H, W_freq)
+            Q_t, d_K_t, d_V_t, w_KV_t, U_K_t, U_V_t = inputs
+            # Q_t: (B, C, H, W) spatial
+            # d_K_t, d_V_t, w_KV_t: (B, 1, H, W_freq)
+            # U_K_t, U_V_t: (B, C, H, W_freq) spectral
+
+            # --- K update ---
+            # 1. Apply decay and kernel in spectral: d_K × W_K × K_prev
+            K_decay_hat = d_K_t * W_K_hat_exp * K_hat_prev  # (B, C, H, W_freq)
+
+            # 2. IFFT to spatial for Q gating
+            K_decay_spatial = jnp.fft.irfft2(K_decay_hat, s=(H, W), axes=(2, 3))  # (B, C, H, W)
+            U_K_spatial = jnp.fft.irfft2(U_K_t, s=(H, W), axes=(2, 3))
+
+            # 3. Element-wise Q gating in spatial (THE CORRECT OPERATION!)
+            K_new_spatial = Q_t * K_decay_spatial + Q_t * U_K_spatial  # (B, C, H, W)
+
+            # 4. FFT back to spectral for next iteration
+            K_hat_new = jnp.fft.rfft2(K_new_spatial, axes=(2, 3))  # (B, C, H, W_freq)
+
+            # --- V update ---
+            # V gets Q-gated K contribution plus its own decay
+            # 1. V decay in spectral
+            V_decay_hat = d_V_t * W_V_hat_exp * V_hat_prev
+
+            # 2. IFFT for Q gating of K→V contribution
+            V_decay_spatial = jnp.fft.irfft2(V_decay_hat, s=(H, W), axes=(2, 3))
+            U_V_spatial = jnp.fft.irfft2(U_V_t, s=(H, W), axes=(2, 3))
+
+            # 3. K→V flow with Q gating in spatial
+            # w_KV is in spectral, so we need to handle it carefully
+            # For simplicity, treat w_KV as a scalar-like gate (average over spatial)
+            w_KV_spatial = jnp.fft.irfft2(
+                jnp.broadcast_to(w_KV_t, (B, C, H, W_freq)), s=(H, W), axes=(2, 3)
+            )
+            K_to_V_spatial = Q_t * w_KV_spatial * K_new_spatial
+
+            # 4. Combine: V = K→V + decay + input
+            V_new_spatial = K_to_V_spatial + V_decay_spatial + U_V_spatial
+
+            # 5. FFT back to spectral
+            V_hat_new = jnp.fft.rfft2(V_new_spatial, axes=(2, 3))
+
+            return (K_hat_new, V_hat_new), (K_new_spatial, V_new_spatial)
+
+        # Prepare inputs for scan: transpose T to first axis
+        # Q_spatial: (B, T, C, H, W) -> (T, B, C, H, W)
+        Q_scan = Q_spatial.transpose(1, 0, 2, 3, 4)
+        d_K_scan = d_K.transpose(1, 0, 2, 3, 4)  # (T, B, 1, H, W_freq)
+        d_V_scan = d_V.transpose(1, 0, 2, 3, 4)
+        w_KV_scan = w_KV.transpose(1, 0, 2, 3, 4)
+        U_K_scan = U_K.transpose(1, 0, 2, 3, 4)  # (T, B, C, H, W_freq)
+        U_V_scan = U_V.transpose(1, 0, 2, 3, 4)
+
+        # Initial states (zeros in spectral space)
+        K_hat_init = jnp.zeros((B, C, H, W_freq), dtype=jnp.complex64)
+        V_hat_init = jnp.zeros((B, C, H, W_freq), dtype=jnp.complex64)
+
+        # Run sequential scan
+        _, (K_spatial_all, V_spatial_all) = jax.lax.scan(
+            sequential_step,
+            (K_hat_init, V_hat_init),
+            (Q_scan, d_K_scan, d_V_scan, w_KV_scan, U_K_scan, U_V_scan),
+        )
+        # K_spatial_all, V_spatial_all: (T, B, C, H, W)
+
+        # Transpose back: (T, B, C, H, W) -> (B, T, C, H, W)
+        V_spatial = V_spatial_all.transpose(1, 0, 2, 3, 4)
+
+        # =====================================================================
+        # 6. OUTPUT
+        # =====================================================================
+        # LayerNorm on V
+        ln_gamma = self.param('ln_gamma', nn.initializers.ones, (C, 1, 1))
+        ln_beta = self.param('ln_beta', nn.initializers.zeros, (C, 1, 1))
+
+        # Normalize over spatial dims
+        mean = V_spatial.mean(axis=(-2, -1), keepdims=True)
+        std = V_spatial.std(axis=(-2, -1), keepdims=True) + 1e-6
+        V_norm = (V_spatial - mean) / std
+        V_scaled = ln_gamma[None, None, :, :, :] * V_norm + ln_beta[None, None, :, :, :]
+
+        # Transpose and project: (B, T, C, H, W) -> (B, T, H, W, C)
+        output = V_scaled.transpose(0, 1, 3, 4, 2)
+        return nn.Dense(C, name='output_proj')(output)
+
+
+class AdditiveCSSM(nn.Module):
+    """
+    Additive K/Q/V CSSM with triangular 3×3 scan.
+
+    ============================================================================
+    KEY FEATURES
+    ============================================================================
+
+    1. **Single shared kernel**: One spatial kernel W for Q and K spreading
+    2. **Unidirectional Q→K coupling**: K sees Q via w_kq, but Q doesn't see K
+    3. **Additive Q+K→V**: V accumulates Q and K independently (not Q·K)
+    4. **Scalar V decay**: V has no spatial kernel, just decay
+
+    ============================================================================
+    DYNAMICS
+    ============================================================================
+
+    Q_t = (d_Q ⊙ W) * Q_{t-1} + U_Q           (Q evolves independently)
+    K_t = (d_K ⊙ W) * K_{t-1} + (w_kq ⊙ W) * Q_{t-1} + U_K   (K sees Q)
+    V_t = d_V · V_{t-1} + γ · Q_{t-1} + γ · K_{t-1} + U_V    (V accumulates Q+K)
+
+    In log-space transition matrix (triangular for associativity):
+
+               Q                  K                  V
+    Q  [ log(d_Q⊙Ŵ)              -∞                -∞   ]
+    K  [ log(w_kq⊙Ŵ)       log(d_K⊙Ŵ)              -∞   ]
+    V  [   log γ             log γ            log d_V   ]
+
+    ============================================================================
+    KEY DIFFERENCES FROM TransformerCSSM
+    ============================================================================
+
+    | Feature | TransformerCSSM | AdditiveCSSM |
+    |---------|-----------------|--------------|
+    | States | Q, K, A | Q, K, V |
+    | Q↔K coupling | Symmetric (w_qk both ways) | Unidirectional (w_kq only) |
+    | Feedback | A→Q (recurrent loop) | None (strictly triangular) |
+    | V/A kernel | Shared kernel K | Scalar only (d_V) |
+    | Scan type | 3×3 coupled | 3×3 triangular |
+
+    The simpler triangular structure may be easier to optimize while still
+    capturing Q→K→V information flow.
+
+    ============================================================================
+    GATES (9 total)
+    ============================================================================
+
+    | Gate | Range | Role |
+    |------|-------|------|
+    | d_Q | 0.1-0.99 | Q self-decay |
+    | d_K | 0.1-0.99 | K self-decay |
+    | d_V | 0.1-0.99 | V self-decay (scalar, no spatial kernel) |
+    | w_kq | 0-1 | Q→K coupling weight |
+    | gamma | 0-1 | Q,K→V accumulation weight |
+    | B_Q | 0-1 | Q input gate |
+    | B_K | 0-1 | K input gate |
+    | B_V | 0-1 | V input gate |
+    | C_gate | 0-1 | Output gate |
+
+    Uses GOOM (Generalized Order of Magnitude) log-space with custom VJP
+    for gradient-stable computation. No LayerNorm in output path.
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size for Q, K lateral connections
+        rope_mode: Position encoding mode
+        rope_base: Base for RoPE frequency computation
+        spectral_rho: Maximum spectral magnitude for stability (used if spectral_clip=True)
+        position_independent_gates: Compute gates from raw input for length generalization
+        block_size: Unused, for API compatibility
+    """
+    channels: int
+    kernel_size: int = 11
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    spectral_rho: float = 0.999
+    position_independent_gates: bool = False
+    block_size: int = 1
+    no_k_state: bool = False         # Drop K → 2×2 Q+V scan (add_kqv_2)
+    single_state: bool = False       # 1-state scalar scan (add_kqv_1)
+    use_goom: bool = True            # Use GOOM custom VJP; False = standard jnp.log/exp
+    gate_type: str = 'dense'         # 'dense' (per-frequency), 'channel' (per-channel), 'scalar' (single value)
+    learned_init: bool = False       # Learn initial state for the recurrence (vs starting from zero)
+    use_complex32: bool = False      # Linear-split scan: bf16 real + bf16 imag (skips GOOM entirely)
+    use_ssd: bool = False            # Use SSD chunked scan instead of associative scan
+    ssd_chunk_size: int = 8          # Chunk size for SSD
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with triangular Q→K→V dynamics (or Q→V if no_k_state).
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # Log-space conversion helpers (GOOM or standard)
+        if self.use_goom:
+            _to_log = to_goom
+            _from_log = from_goom
+        else:
+            def _to_log(x):
+                x_c = x.astype(jnp.complex64) if not jnp.iscomplexobj(x) else x
+                return jnp.log(jnp.abs(x_c) + 1e-8) + 1j * jnp.angle(x_c)
+            def _from_log(x):
+                return jnp.exp(x)
+
+        # Save raw input for position-independent gates
+        x_raw = x if self.position_independent_gates else None
+
+        # Optional position encoding
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # =====================================================================
+        # 1. SINGLE SHARED SPATIAL KERNEL
+        # =====================================================================
+        k_shape = (C, self.kernel_size, self.kernel_size)
+
+        def pad_kernel(k_spatial):
+            """Pad kernel to input size for FFT."""
+            pad_h = max(0, (H - self.kernel_size) // 2)
+            pad_w = max(0, (W - self.kernel_size) // 2)
+            pad_h_after = H - self.kernel_size - pad_h
+            pad_w_after = W - self.kernel_size - pad_w
+
+            if self.kernel_size > H or self.kernel_size > W:
+                start_h = (self.kernel_size - H) // 2
+                start_w = (self.kernel_size - W) // 2
+                return k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+            else:
+                return jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        # Single shared kernel for Q (and K if 3-state)
+        kernel = self.param('kernel', nn.initializers.xavier_normal(), k_shape)
+        k_padded = pad_kernel(kernel)
+        k_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
+        k_hat = _stable_spectral_magnitude(k_hat, rho=self.spectral_rho)
+
+        # Broadcast kernel: (C, H, W_freq) -> (1, 1, C, H, W_freq)
+        K_b = k_hat[None, None, ...].astype(jnp.complex64)
+        ones = jnp.ones_like(K_b)
+
+        # =====================================================================
+        # 2. PROJECT INPUT (spatial — FFT deferred to after input gating)
+        # =====================================================================
+        x_flat = x.reshape(B * T, H, W, C)
+
+        if self.single_state:
+            x_proj = nn.Dense(C, name='x_proj')(x_flat).reshape(B, T, H, W, C)
+        elif self.no_k_state:
+            qv_proj = nn.Dense(2 * C, name='qv_proj')(x_flat).reshape(B, T, H, W, 2 * C)
+            q_in = qv_proj[..., :C]
+            v_in = qv_proj[..., C:]
+        else:
+            qkv_proj = nn.Dense(3 * C, name='qkv_proj')(x_flat).reshape(B, T, H, W, 3 * C)
+            q_in = qkv_proj[..., :C]
+            k_in = qkv_proj[..., C:2*C]
+            v_in = qkv_proj[..., 2*C:]
+
+        # =====================================================================
+        # 3. INPUT-DEPENDENT GATES
+        # =====================================================================
+        gate_input = x_raw if x_raw is not None else x
+        ctx = gate_input.mean(axis=(2, 3))  # (B, T, C) - spatial average for context
+        if x_raw is None:
+            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+        # Whether I/O gates (B, C) are spatial (applied before FFT / after IFFT)
+        _spatial_gates = self.gate_type in ('conv', 'channel', 'dense_decay')
+
+        # Gate helper: creates a gate with the specified gate_type
+        def _gate(name, bounded=False, spatial=False):
+            """Create a gate.
+            bounded=True → decay gate in [0.1, 0.99].
+            spatial=True → I/O gate. For conv/channel/dense_decay: real spatial (B,T,H,W,C).
+                           For dense/dense_io/scalar: spectral (same as decay).
+            """
+            if self.gate_type == 'conv':
+                # 5×5×C×C conv for all gates
+                gate_flat = gate_input.reshape(B * T, H, W, C)
+                raw = nn.sigmoid(nn.Conv(
+                    C, kernel_size=(5, 5), padding='SAME', name=name
+                )(gate_flat))
+                if spatial:
+                    return raw.reshape(B, T, H, W, C)
+                else:
+                    raw = raw.mean(axis=(1, 2)).reshape(B, T, C, 1, 1)
+                    return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'channel':
+                if spatial:
+                    gate_flat = gate_input.reshape(B * T, H, W, C)
+                    raw = nn.sigmoid(nn.Conv(
+                        C, kernel_size=(1, 1), padding='SAME', name=name
+                    )(gate_flat))
+                    return raw.reshape(B, T, H, W, C)
+                else:
+                    raw = nn.sigmoid(nn.Dense(C, name=name)(ctx))
+                    raw = raw.reshape(B, T, C, 1, 1)
+                    return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'dense_decay':
+                # Decay: dense per-frequency | I/O: channel spatial
+                if spatial:
+                    gate_flat = gate_input.reshape(B * T, H, W, C)
+                    raw = nn.sigmoid(nn.Conv(
+                        C, kernel_size=(1, 1), padding='SAME', name=name
+                    )(gate_flat))
+                    return raw.reshape(B, T, H, W, C)
+                else:
+                    raw = nn.sigmoid(nn.Dense(n_gate, name=name)(ctx))
+                    raw = raw.reshape(B, T, 1, H, W_freq)
+                    return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'dense_io':
+                # Decay: channel per-channel | I/O: dense per-frequency
+                if spatial:
+                    raw = nn.sigmoid(nn.Dense(n_gate, name=name)(ctx))
+                    raw = raw.reshape(B, T, 1, H, W_freq)
+                    return raw
+                else:
+                    raw = nn.sigmoid(nn.Dense(C, name=name)(ctx))
+                    raw = raw.reshape(B, T, C, 1, 1)
+                    return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'factored':
+                # Separable H × W_freq outer product — 20× fewer params than dense
+                row = nn.Dense(H, name=f'{name}_h')(ctx)       # (B, T, H)
+                col = nn.Dense(W_freq, name=f'{name}_w')(ctx)  # (B, T, W_freq)
+                raw = nn.sigmoid(row[..., :, None] + col[..., None, :])  # (B, T, H, W_freq)
+                raw = raw.reshape(B, T, 1, H, W_freq)
+                return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'spectral_conv':
+                # 5×5 conv over input's spectral magnitude — per-channel
+                gi_flat = gate_input.reshape(B * T, H, W, C)
+                gi_spec = jnp.fft.rfft2(gi_flat.transpose(0, 3, 1, 2), axes=(2, 3))
+                gi_mag = jnp.abs(gi_spec).transpose(0, 2, 3, 1)  # (B*T, H, W_freq, C)
+                raw = nn.sigmoid(nn.Conv(
+                    C, kernel_size=(5, 5), padding='SAME', name=name
+                )(gi_mag))
+                raw = raw.transpose(0, 3, 1, 2).reshape(B, T, C, H, W_freq)
+                return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'low_rank':
+                # Bottleneck Dense(C→8→n_gate) — true low-rank factorization
+                hidden = nn.Dense(8, name=f'{name}_down')(ctx)
+                raw = nn.sigmoid(nn.Dense(n_gate, name=f'{name}_up')(hidden))
+                raw = raw.reshape(B, T, 1, H, W_freq)
+                return 0.1 + 0.89 * raw if bounded else raw
+            elif self.gate_type == 'scalar':
+                out_dim, shape = 1, (B, T, 1, 1, 1)
+            else:  # 'dense' (default)
+                out_dim, shape = n_gate, (B, T, 1, H, W_freq)
+            raw = nn.sigmoid(nn.Dense(out_dim, name=name)(ctx))
+            raw = raw.reshape(*shape)
+            return 0.1 + 0.89 * raw if bounded else raw
+
+        def _to_spectral(spatial_in):
+            """(B,T,H,W,C) → (B,T,C,H,W_freq) via rfft2."""
+            return jnp.fft.rfft2(spatial_in.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+        def _gate_and_fft(spatial_in, b_gate):
+            """Apply input gate and FFT.
+            Conv: spatial gate × spatial input → FFT.
+            Others: FFT → spectral gate × spectral input.
+            """
+            if _spatial_gates:
+                return _to_spectral(spatial_in * b_gate)
+            else:
+                return _to_spectral(spatial_in) * b_gate
+
+        def _prepend_init(A_log, U_log, n_states):
+            """Prepend virtual timestep with identity transition and learned init.
+
+            For the associative scan: prepending (I, init) means the scan
+            output at position 1 becomes A[0] @ init + U[0], giving us a
+            learned initial state. We strip position 0 from the output.
+            """
+            LOG_ZERO = jnp.complex64(-1e4 + 0j)
+            if n_states > 1:
+                eye = jnp.where(
+                    jnp.eye(n_states, dtype=bool),
+                    jnp.complex64(0 + 0j),
+                    LOG_ZERO,
+                )
+                A_init = jnp.broadcast_to(eye, (B, 1, C, H, W_freq, n_states, n_states))
+            else:
+                # Scalar: identity = 1, log(1) = 0+0j
+                A_init = jnp.zeros((B, 1, C, H, W_freq), dtype=jnp.complex64)
+
+            init_shape = (1, 1, C, 1, 1, n_states) if n_states > 1 else (1, 1, C, 1, 1)
+            init_real = self.param('init_real', nn.initializers.constant(-10.0), init_shape)
+            init_imag = self.param('init_imag', nn.initializers.zeros, init_shape)
+            U_init = jnp.broadcast_to(
+                (init_real + 1j * init_imag).astype(jnp.complex64),
+                U_log.shape[:1] + (1,) + U_log.shape[2:],
+            )
+
+            return (
+                jnp.concatenate([A_init, A_log], axis=1),
+                jnp.concatenate([U_init, U_log], axis=1),
+            )
+
+        if self.single_state:
+            # =================================================================
+            # 1-STATE PATH: single scalar scan
+            # =================================================================
+            # X_t = d · W · X_{t-1} + B · U
+            d_X = _gate('d_X', bounded=True)
+            B_X = _gate('B_X', spatial=True)
+            C_gate = _gate('C_gate', spatial=True)
+
+            # Transition: d_X · kernel (linear space)
+            A_X = d_X.astype(jnp.complex64) * K_b
+
+            # Input with gate + FFT
+            U_X_hat = _gate_and_fft(x_proj, B_X)
+
+            if self.use_ssd:
+                # SSD chunked scan: works in linear complex space
+                A_c = A_X.astype(jnp.complex64)
+                U_c = U_X_hat.astype(jnp.complex64)
+                V_hat = ssd_scan(A_c, U_c, chunk_size=self.ssd_chunk_size)
+            elif self.use_complex32:
+                # Linear-split: skip GOOM, split (re_bf16, im_bf16) directly
+                A_c = A_X.astype(jnp.complex64)
+                U_c = U_X_hat.astype(jnp.complex64)
+
+                if self.learned_init:
+                    # Need log-space init for prepend, then convert back
+                    A_log = _to_log(A_c)
+                    U_log = _to_log(U_c)
+                    A_log, U_log = _prepend_init(A_log, U_log, n_states=1)
+                    A_c = _from_log(A_log)
+                    U_c = _from_log(U_log)
+
+                A_re, A_im = complex64_to_linear_split(A_c)
+                U_re, U_im = complex64_to_linear_split(U_c)
+                _, _, U_re_out, U_im_out = jax.lax.associative_scan(
+                    linear_split_scalar_scan_op,
+                    (A_re, A_im, U_re, U_im), axis=1)
+                V_hat = linear_split_to_complex64(U_re_out, U_im_out)
+
+                if self.learned_init:
+                    V_hat = V_hat[:, 1:]
+            else:
+                # Standard GOOM path
+                A_log = _to_log(A_X)
+                U_log = _to_log(U_X_hat)
+
+                if self.learned_init:
+                    A_log, U_log = _prepend_init(A_log, U_log, n_states=1)
+
+                _, X_log = jax.lax.associative_scan(
+                    cssm_scalar_scan_op, (A_log, U_log), axis=1
+                )
+
+                if self.learned_init:
+                    X_log = X_log[:, 1:]
+                V_hat = _from_log(X_log)  # (B, T, C, H, W_freq)
+
+        else:
+            # Shared gates for 2-state and 3-state paths
+            d_Q = _gate('d_Q', bounded=True)
+            d_V = _gate('d_V', bounded=True)
+            gamma = _gate('gamma')
+            B_Q = _gate('B_Q', spatial=True)
+            B_V = _gate('B_V', spatial=True)
+            C_gate = _gate('C_gate', spatial=True)
+
+        if self.single_state:
+            pass  # Already computed V_hat above
+
+        elif self.no_k_state:
+            # =================================================================
+            # 2-STATE PATH: Q + V (no K)
+            # =================================================================
+            #        Q              V
+            # Q  [ d_Q·K_b          0       ]
+            # V  [ γ·ones        d_V·ones   ]
+
+            d_Q_c = d_Q.astype(jnp.complex64)
+            d_V_c = d_V.astype(jnp.complex64)
+            zeros = jnp.zeros_like(d_Q_c * K_b)
+
+            A_00 = d_Q_c * K_b         # Q self-decay with kernel
+            A_01 = zeros               # No V→Q
+            A_10 = gamma * ones        # Q→V (scalar)
+            A_11 = d_V_c * ones        # V self-decay (scalar)
+
+            row_Q = jnp.stack([A_00, A_01], axis=-1)
+            row_V = jnp.stack([A_10, A_11], axis=-1)
+            K_mat = jnp.stack([row_Q, row_V], axis=-2)
+
+            U_Q_hat = _gate_and_fft(q_in, B_Q)
+            U_V_hat = _gate_and_fft(v_in, B_V)
+            U_vec = jnp.stack([U_Q_hat, U_V_hat], axis=-1)
+
+            if self.use_ssd:
+                # SSD cascaded: decompose 2×2 triangular into 2 scalar SSMs
+                a_Q = (d_Q_c * K_b).astype(jnp.complex64)
+                a_V = (d_V_c * ones).astype(jnp.complex64)
+                gamma_c = (gamma * ones).astype(jnp.complex64)
+
+                Q_all = ssd_scan(a_Q, U_Q_hat.astype(jnp.complex64),
+                                 chunk_size=self.ssd_chunk_size)
+                Q_prev = jnp.concatenate(
+                    [jnp.zeros_like(Q_all[:, :1]), Q_all[:, :-1]], axis=1)
+
+                U_V_eff = gamma_c * Q_prev + U_V_hat.astype(jnp.complex64)
+                V_hat = ssd_scan(a_V, U_V_eff, chunk_size=self.ssd_chunk_size)
+            elif self.use_complex32:
+                # Linear-split: skip GOOM, split (re_bf16, im_bf16) directly
+                K_c = K_mat.astype(jnp.complex64)
+                U_c = U_vec.astype(jnp.complex64)
+
+                if self.learned_init:
+                    K_log = _to_log(K_c)
+                    U_log = _to_log(U_c)
+                    K_log, U_log = _prepend_init(K_log, U_log, n_states=2)
+                    K_c = _from_log(K_log)
+                    U_c = _from_log(U_log)
+
+                K_re, K_im = complex64_to_linear_split(K_c)
+                U_re, U_im = complex64_to_linear_split(U_c)
+                _, _, U_re_out, U_im_out = jax.lax.associative_scan(
+                    linear_split_2x2_scan_op,
+                    (K_re, K_im, U_re, U_im), axis=1)
+                QV_hat = linear_split_to_complex64(U_re_out, U_im_out)
+
+                if self.learned_init:
+                    QV_hat = QV_hat[:, 1:]
+                V_hat = QV_hat[..., 1]
+            else:
+                # Scan (2×2)
+                K_log = _to_log(K_mat)
+                U_log = _to_log(U_vec)
+
+                if self.learned_init:
+                    K_log, U_log = _prepend_init(K_log, U_log, n_states=2)
+
+                _, State_log = jax.lax.associative_scan(
+                    cssm_matrix_scan_op, (K_log, U_log), axis=1
+                )
+
+                if self.learned_init:
+                    State_log = State_log[:, 1:]
+                QV_hat = _from_log(State_log)  # (B, T, C, H, W_freq, 2)
+                V_hat = QV_hat[..., 1]
+
+        else:
+            # =================================================================
+            # 3-STATE PATH: Q + K + V
+            # =================================================================
+            d_K = _gate('d_K', bounded=True)
+            w_kq = _gate('w_kq')
+            B_K = _gate('B_K', spatial=True)
+
+            #            Q              K              V
+            # Q  [ d_Q·K_b           0              0   ]
+            # K  [ w_kq·K_b       d_K·K_b           0   ]
+            # V  [ γ·ones          γ·ones        d_V·ones ]
+
+            d_Q_c = d_Q.astype(jnp.complex64)
+            d_K_c = d_K.astype(jnp.complex64)
+            d_V_c = d_V.astype(jnp.complex64)
+            zeros = jnp.zeros_like(d_Q_c * ones)
+
+            A_00 = d_Q_c * K_b
+            A_01 = zeros
+            A_02 = zeros
+            A_10 = w_kq * K_b
+            A_11 = d_K_c * K_b
+            A_12 = zeros
+            A_20 = gamma * ones
+            A_21 = gamma * ones
+            A_22 = d_V_c * ones
+
+            row_Q = jnp.stack([A_00, A_01, A_02], axis=-1)
+            row_K = jnp.stack([A_10, A_11, A_12], axis=-1)
+            row_V = jnp.stack([A_20, A_21, A_22], axis=-1)
+            K_mat = jnp.stack([row_Q, row_K, row_V], axis=-2)
+
+            U_Q_hat = _gate_and_fft(q_in, B_Q)
+            U_K_hat = _gate_and_fft(k_in, B_K)
+            U_V_hat = _gate_and_fft(v_in, B_V)
+            U_vec = jnp.stack([U_Q_hat, U_K_hat, U_V_hat], axis=-1)
+
+            # Scan (3×3)
+            if self.use_ssd:
+                # SSD cascaded: decompose 3×3 triangular into 3 scalar SSMs
+                # Q_t = a_Q * Q_{t-1} + U_Q
+                # K_t = a_K * K_{t-1} + w_kq·K_b · Q_{t-1} + U_K
+                # V_t = a_V * V_{t-1} + γ · Q_{t-1} + γ · K_{t-1} + U_V
+                a_Q = (d_Q_c * K_b).astype(jnp.complex64)
+                a_K = (d_K_c * K_b).astype(jnp.complex64)
+                a_V = (d_V_c * ones).astype(jnp.complex64)
+                w_kq_c = (w_kq * K_b).astype(jnp.complex64)
+                gamma_c = (gamma * ones).astype(jnp.complex64)
+                L = self.ssd_chunk_size
+
+                # 1. Q scan (independent)
+                Q_all = ssd_scan(a_Q, U_Q_hat.astype(jnp.complex64), chunk_size=L)
+                Q_prev = jnp.concatenate(
+                    [jnp.zeros_like(Q_all[:, :1]), Q_all[:, :-1]], axis=1)
+
+                # 2. K scan (depends on Q)
+                U_K_eff = w_kq_c * Q_prev + U_K_hat.astype(jnp.complex64)
+                K_all = ssd_scan(a_K, U_K_eff, chunk_size=L)
+                K_prev = jnp.concatenate(
+                    [jnp.zeros_like(K_all[:, :1]), K_all[:, :-1]], axis=1)
+
+                # 3. V scan (depends on Q and K)
+                U_V_eff = gamma_c * Q_prev + gamma_c * K_prev + U_V_hat.astype(jnp.complex64)
+                V_hat = ssd_scan(a_V, U_V_eff, chunk_size=L)
+            elif self.use_complex32:
+                # Linear-split: skip GOOM, split (re_bf16, im_bf16) directly
+                K_c = K_mat.astype(jnp.complex64)
+                U_c = U_vec.astype(jnp.complex64)
+
+                if self.learned_init:
+                    K_log = _to_log(K_c)
+                    U_log = _to_log(U_c)
+                    K_log, U_log = _prepend_init(K_log, U_log, n_states=3)
+                    K_c = _from_log(K_log)
+                    U_c = _from_log(U_log)
+
+                K_re, K_im = complex64_to_linear_split(K_c)
+                U_re, U_im = complex64_to_linear_split(U_c)
+                _, _, U_re_out, U_im_out = jax.lax.associative_scan(
+                    linear_split_3x3_scan_op,
+                    (K_re, K_im, U_re, U_im), axis=1)
+                QKV_hat = linear_split_to_complex64(U_re_out, U_im_out)
+
+                if self.learned_init:
+                    QKV_hat = QKV_hat[:, 1:]
+                V_hat = QKV_hat[..., 2]
+            else:
+                K_log = _to_log(K_mat)
+                U_log = _to_log(U_vec)
+
+                if self.learned_init:
+                    K_log, U_log = _prepend_init(K_log, U_log, n_states=3)
+
+                _, State_log = jax.lax.associative_scan(
+                    cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
+                )
+
+                if self.learned_init:
+                    State_log = State_log[:, 1:]
+                QKV_hat = _from_log(State_log)  # (B, T, C, H, W_freq, 3)
+                V_hat = QKV_hat[..., 2]
+
+        # Capture V_hat for visualization (no-op when 'intermediates' not mutable)
+        self.sow('intermediates', 'V_hat', V_hat)
+
+        # =====================================================================
+        # OUTPUT: apply C gate, spectral → spatial, project
+        # =====================================================================
+        if _spatial_gates:
+            # Conv/channel: C_gate is spatial (B,T,H,W,C) — apply after IFFT
+            V_spatial = jnp.fft.irfft2(V_hat, s=(H, W), axes=(3, 4))  # (B, T, C, H, W)
+            output = V_spatial.transpose(0, 1, 3, 4, 2) * C_gate
+        else:
+            # Others: C_gate is spectral-compatible — apply before IFFT
+            V_hat_gated = V_hat * C_gate
+            V_spatial = jnp.fft.irfft2(V_hat_gated, s=(H, W), axes=(3, 4))
+            output = V_spatial.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+
+        return nn.Dense(C, name='output_proj')(output)
