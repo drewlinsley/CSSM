@@ -506,6 +506,7 @@ class PathfinderTFRecordLoader:
         shuffle: bool = True,
         shuffle_buffer: int = 10000,
         prefetch_batches: int = 2,
+        image_size: int = None,
     ):
         if not HAS_TF:
             raise ImportError("TensorFlow required for TFRecord loading. Install with: pip install tensorflow")
@@ -536,17 +537,21 @@ class PathfinderTFRecordLoader:
                 f"Or: tfrecord_dir/difficulty_{{difficulty}}/{split}/*.tfrecord"
             )
 
-        # Load metadata for sample count
+        # Load metadata for sample count and native image size
         if metadata_path.exists():
             import json
             with open(metadata_path) as f:
                 metadata = json.load(f)
             self.n_samples = metadata.get(f'{split}_samples', 0)
-            self.image_size = metadata.get('image_size', 224)
+            self._native_size = metadata.get('image_size', 224)
         else:
             # Estimate from file count
             self.n_samples = len(self.shard_paths) * 5000  # Rough estimate
-            self.image_size = 224
+            self._native_size = 224
+
+        # image_size: output size after optional resize.  If None, use native.
+        self.image_size = image_size if image_size is not None else self._native_size
+        self._needs_resize = (self.image_size != self._native_size)
 
         # Create TF dataset
         self.dataset = self._create_dataset(shuffle_buffer, prefetch_batches)
@@ -562,9 +567,14 @@ class PathfinderTFRecordLoader:
         }
         example = tf.io.parse_single_example(serialized, features)
 
-        # Decode image
+        # Decode image at native (stored) resolution
         image = tf.io.decode_raw(example['image'], tf.float32)
-        image = tf.reshape(image, [self.image_size, self.image_size, 3])
+        image = tf.reshape(image, [self._native_size, self._native_size, 3])
+
+        # Resize if a different output size was requested
+        if self._needs_resize:
+            image = tf.image.resize(image, [self.image_size, self.image_size],
+                                    method='bilinear')
 
         label = tf.cast(example['label'], tf.int32)
 
@@ -624,6 +634,7 @@ def get_pathfinder_tfrecord_loader(
     shuffle: bool = True,
     shuffle_buffer: int = 10000,
     prefetch_batches: int = 2,
+    image_size: int = None,
 ):
     """
     Get TFRecord-based loader for Pathfinder.
@@ -639,6 +650,8 @@ def get_pathfinder_tfrecord_loader(
         shuffle: Whether to shuffle data
         shuffle_buffer: Size of shuffle buffer
         prefetch_batches: Number of batches to prefetch
+        image_size: Output image size. If None, uses native size from metadata.
+            If different from native, images are bilinear-resized in the pipeline.
 
     Returns:
         PathfinderTFRecordLoader yielding (images, labels)
@@ -652,8 +665,12 @@ def get_pathfinder_tfrecord_loader(
         shuffle=shuffle,
         shuffle_buffer=shuffle_buffer,
         prefetch_batches=prefetch_batches,
+        image_size=image_size,
     )
 
-    print(f"  TFRecord loader: {len(loader)} batches from {len(loader.shard_paths)} shards")
+    size_info = f"{loader.image_size}px"
+    if loader._needs_resize:
+        size_info += f" (resized from {loader._native_size}px)"
+    print(f"  TFRecord loader: {len(loader)} batches from {len(loader.shard_paths)} shards, {size_info}")
 
     return loader

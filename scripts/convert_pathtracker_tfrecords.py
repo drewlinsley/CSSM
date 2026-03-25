@@ -79,7 +79,7 @@ def collect_files(input_dir):
     return files
 
 
-def write_shards(files, output_dir, samples_per_shard, split_name):
+def write_shards(files, output_dir, samples_per_shard, split_name, target_frames=None):
     """Write a list of (filepath, label) to TFRecord shards."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -99,6 +99,12 @@ def write_shards(files, output_dir, samples_per_shard, split_name):
 
         # Load video and normalize to float32
         video = np.load(filepath)  # (64, 32, 32, 3) uint8
+
+        # Subsample frames if requested
+        if target_frames is not None and target_frames < video.shape[0]:
+            indices = np.linspace(0, video.shape[0] - 1, target_frames, dtype=int)
+            video = video[indices]
+
         video_f32 = (video.astype(np.float32) / np.float32(255.0) - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
         T, H, W, C = video_f32.shape
@@ -135,10 +141,12 @@ def main():
                         help='Output directory for TFRecords')
     parser.add_argument('--samples_per_shard', type=int, default=1000,
                         help='Samples per TFRecord shard')
-    parser.add_argument('--train_size', type=int, default=100000,
+    parser.add_argument('--train_size', type=int, default=20000,
                         help='Number of training samples')
-    parser.add_argument('--test_size', type=int, default=10000,
+    parser.add_argument('--test_size', type=int, default=2000,
                         help='Number of test samples')
+    parser.add_argument('--num_frames', type=int, default=None,
+                        help='Subsample to this many frames (e.g. 32). Default: use all frames.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for split')
     args = parser.parse_args()
@@ -181,14 +189,17 @@ def main():
     # Read actual shape from first file
     sample_video = np.load(files[0][0])
     actual_frames, actual_h, actual_w, actual_c = sample_video.shape
+    out_frames = args.num_frames if args.num_frames else actual_frames
     print(f"Video shape: ({actual_frames}, {actual_h}, {actual_w}, {actual_c})")
+    if args.num_frames:
+        print(f"Subsampling to {out_frames} frames (from {actual_frames})")
     print()
 
     # Write each split
     metadata = {
         'total_samples': len(files),
         'image_size': actual_h,
-        'num_frames': actual_frames,
+        'num_frames': out_frames,
         'channels': actual_c,
         'seed': args.seed,
     }
@@ -196,7 +207,8 @@ def main():
     for split_name, split_files in splits.items():
         split_dir = os.path.join(args.output_dir, split_name)
         n_written, n_shards = write_shards(
-            split_files, split_dir, args.samples_per_shard, split_name
+            split_files, split_dir, args.samples_per_shard, split_name,
+            target_frames=args.num_frames
         )
         metadata[f'{split_name}_samples'] = n_written
         metadata[f'{split_name}_shards'] = n_shards

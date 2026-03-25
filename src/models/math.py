@@ -381,6 +381,36 @@ def cssm_3x3_matrix_scan_op(
     return K_new, u_new
 
 
+def cssm_general_matrix_scan_op(
+    carry_i: Tuple[jnp.ndarray, jnp.ndarray],
+    carry_j: Tuple[jnp.ndarray, jnp.ndarray]
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Associative operator for general d_k x d_k CSSM in log-space.
+
+    Uses log_matmul_block / log_matvec_block from operations.py for
+    arbitrary d_k (not just 2 or 3).
+
+    K: (..., d_k, d_k), u: (..., d_k) in GOOM representation.
+    Scan: K_new = K_j @ K_i, u_new = K_j @ u_i + u_j
+    """
+    K_i, u_i = carry_i
+    K_j, u_j = carry_j
+
+    d_k = K_i.shape[-1]
+
+    # K_new = K_j @ K_i in log-space
+    K_new = log_matmul_block(K_j, K_i, d_k)
+
+    # Ku_i = K_j @ u_i in log-space
+    Ku_i = log_matvec_block(K_j, u_i, d_k)
+
+    # u_new = Ku_i + u_j in log-space (element-wise)
+    u_new = log_add_exp(Ku_i, u_j)
+
+    return K_new, u_new
+
+
 def cssm_3x3_bilinear_scan_op(
     carry_i: Tuple[jnp.ndarray, jnp.ndarray],
     carry_j: Tuple[jnp.ndarray, jnp.ndarray],
@@ -760,30 +790,34 @@ def make_kqv_block_scan_op(block_size: int):
 # All intermediate computation promotes to float32 for numerical stability.
 # Only the stored scan state uses bfloat16.
 
-def complex64_to_linear_split(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Convert complex64 to (re_bf16, im_bf16) in linear space."""
-    return x.real.astype(jnp.bfloat16), x.imag.astype(jnp.bfloat16)
+def complex64_to_linear_split(x: jnp.ndarray, dtype=jnp.bfloat16) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Convert complex64 to (re, im) in the specified dtype (bf16, fp8, etc.)."""
+    return x.real.astype(dtype), x.imag.astype(dtype)
 
 
 def linear_split_to_complex64(re: jnp.ndarray, im: jnp.ndarray) -> jnp.ndarray:
-    """Convert (re, im) back to complex64."""
+    """Convert (re, im) back to complex64. Works with any input dtype."""
     return (re.astype(jnp.float32) + 1j * im.astype(jnp.float32)).astype(jnp.complex64)
 
 
 def _ls_complex_mul(a_re, a_im, b_re, b_im):
-    """Complex multiply with float32 promotion, returns bf16."""
+    """Complex multiply: promote to float32 for math, cast back to input dtype."""
+    store_dtype = a_re.dtype
     ar = a_re.astype(jnp.float32)
     ai = a_im.astype(jnp.float32)
     br = b_re.astype(jnp.float32)
     bi = b_im.astype(jnp.float32)
     out_re = ar * br - ai * bi
     out_im = ar * bi + ai * br
-    return out_re.astype(jnp.bfloat16), out_im.astype(jnp.bfloat16)
+    return out_re.astype(store_dtype), out_im.astype(store_dtype)
 
 
 def _ls_complex_add(a_re, a_im, b_re, b_im):
-    """Complex add, stays in bf16."""
-    return (a_re + b_re), (a_im + b_im)
+    """Complex add: promote to float32 for narrow types, cast back to input dtype."""
+    store_dtype = a_re.dtype
+    sum_re = a_re.astype(jnp.float32) + b_re.astype(jnp.float32)
+    sum_im = a_im.astype(jnp.float32) + b_im.astype(jnp.float32)
+    return sum_re.astype(store_dtype), sum_im.astype(store_dtype)
 
 
 # --- Scalar (add_kqv_1) ---
@@ -944,6 +978,83 @@ def linear_split_3x3_scan_op(carry_i, carry_j):
     return K_re_new, K_im_new, U_re_new, U_im_new
 
 
+# --- General NxN matrix (arbitrary d_k) ---
+
+def _ls_matmul_nxn(A_re, A_im, B_re, B_im):
+    """General NxN complex matrix multiply in linear-split representation.
+    A, B: (..., N, N). Uses einsum for the sum over k."""
+    # C[i,j] = sum_k A[i,k] * B[k,j]
+    # complex mul: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+    C_re = jnp.einsum('...ik,...kj->...ij', A_re, B_re) - \
+           jnp.einsum('...ik,...kj->...ij', A_im, B_im)
+    C_im = jnp.einsum('...ik,...kj->...ij', A_re, B_im) + \
+           jnp.einsum('...ik,...kj->...ij', A_im, B_re)
+    return C_re, C_im
+
+
+def _ls_matvec_nxn(A_re, A_im, v_re, v_im):
+    """General NxN complex matrix-vector multiply in linear-split representation.
+    A: (..., N, N), v: (..., N)."""
+    # y[i] = sum_k A[i,k] * v[k]
+    y_re = jnp.einsum('...ik,...k->...i', A_re, v_re) - \
+           jnp.einsum('...ik,...k->...i', A_im, v_im)
+    y_im = jnp.einsum('...ik,...k->...i', A_re, v_im) + \
+           jnp.einsum('...ik,...k->...i', A_im, v_re)
+    return y_re, y_im
+
+
+def linear_split_general_scan_op(carry_i, carry_j):
+    """General NxN matrix associative scan op in linear-split representation.
+
+    Carry = (K_re, K_im, U_re, U_im).
+    K: (..., N, N), U: (..., N).
+    Scan: K_new = K_j @ K_i, U_new = K_j @ U_i + U_j
+    """
+    K_re_i, K_im_i, U_re_i, U_im_i = carry_i
+    K_re_j, K_im_j, U_re_j, U_im_j = carry_j
+
+    K_re_new, K_im_new = _ls_matmul_nxn(K_re_j, K_im_j, K_re_i, K_im_i)
+    Ku_re, Ku_im = _ls_matvec_nxn(K_re_j, K_im_j, U_re_i, U_im_i)
+    U_re_new, U_im_new = _ls_complex_add(Ku_re, Ku_im, U_re_j, U_im_j)
+
+    return K_re_new, K_im_new, U_re_new, U_im_new
+
+
+# =============================================================================
+# Direct complex64 scan ops (no log-space, no bf16 split — full precision)
+# =============================================================================
+
+def direct_scalar_scan_op(carry_i, carry_j):
+    """Scalar associative scan in direct complex64. No log transform."""
+    K_i, U_i = carry_i
+    K_j, U_j = carry_j
+    return K_j * K_i, K_j * U_i + U_j
+
+def direct_2x2_scan_op(carry_i, carry_j):
+    """2x2 matrix scan in direct complex64."""
+    K_i, U_i = carry_i  # K: (...,2,2), U: (...,2)
+    K_j, U_j = carry_j
+    K_new = jnp.einsum('...ik,...kj->...ij', K_j, K_i)
+    U_new = jnp.einsum('...ik,...k->...i', K_j, U_i) + U_j
+    return K_new, U_new
+
+def direct_3x3_scan_op(carry_i, carry_j):
+    """3x3 matrix scan in direct complex64."""
+    K_i, U_i = carry_i  # K: (...,3,3), U: (...,3)
+    K_j, U_j = carry_j
+    K_new = jnp.einsum('...ik,...kj->...ij', K_j, K_i)
+    U_new = jnp.einsum('...ik,...k->...i', K_j, U_i) + U_j
+    return K_new, U_new
+
+def direct_general_scan_op(carry_i, carry_j):
+    """General NxN matrix scan in direct complex64."""
+    K_i, U_i = carry_i  # K: (...,N,N), U: (...,N)
+    K_j, U_j = carry_j
+    K_new = jnp.einsum('...ik,...kj->...ij', K_j, K_i)
+    U_new = jnp.einsum('...ik,...k->...i', K_j, U_i) + U_j
+    return K_new, U_new
+
+
 # =============================================================================
 # SSD (State Space Duality) chunked scan — Mamba-2 algorithm for scalar SSMs
 # =============================================================================
@@ -1022,6 +1133,8 @@ def ssd_scan(A, X, chunk_size=8, initial_state=None):
     mask = mask.reshape(mask_shape)
 
     # Build causal decay matrix M
+    # Zero upper triangle BEFORE exp to prevent overflow → NaN in backward pass
+    log_decay = jnp.where(mask, log_decay, jnp.zeros_like(log_decay))
     M = jnp.where(mask, jnp.exp(log_decay), jnp.zeros_like(log_decay))
     # M: (B, nc, L, L, *spatial)
 
@@ -1076,6 +1189,127 @@ def ssd_scan(A, X, chunk_size=8, initial_state=None):
     decay_from_start = jnp.exp(log_A_cumsum)  # (B, nc, L, *spatial)
     # Broadcast boundary state into chunk positions
     Y_off = boundary_states[:, :, None] * decay_from_start  # (B, nc, L, *spatial)
+
+    Y = (Y_diag + Y_off).reshape(B_dim, T, *spatial)
+    return Y
+
+
+# =============================================================================
+# Quadratic (attention) scan — O(T²) but fully parallel
+# =============================================================================
+
+def quadratic_scan(A, X):
+    """SSM via quadratic (attention) form: Y = M @ X.
+
+    Builds the T×T causal decay matrix and contracts over source time.
+    O(T²) per position but fully parallel — no sequential dependency.
+    For T=8 this is 64 multiply-adds per position, batched across all
+    (B, C, H, W_freq) positions.
+
+    Args:
+        A: (B, T, ...) complex decay per position per timestep (linear space)
+        X: (B, T, ...) complex input (linear space)
+    Returns:
+        Y: (B, T, ...) scan output, identical to sequential h_t = A_t * h_{t-1} + X_t
+    """
+    B, T = A.shape[0], A.shape[1]
+    spatial = A.shape[2:]
+
+    # Cumulative product in log-space for numerical stability
+    log_A = jnp.log(A + 0j)
+    log_A_cumsum = jnp.cumsum(log_A, axis=1)  # (B, T, ...)
+
+    # M[t,s] = prod_{k=s+1}^{t} A_k = exp(cumsum[t] - cumsum[s])  for t >= s
+    # Expand for broadcasting: (B, T_target, 1, ...) - (B, 1, T_source, ...)
+    n_spatial = len(spatial)
+    expand_t = log_A_cumsum[:, :, None]  # (B, T, 1, ...)
+    expand_s = log_A_cumsum[:, None, :]  # (B, 1, T, ...)
+    log_decay = expand_t - expand_s  # (B, T, T, ...)
+
+    # Causal mask: only t >= s
+    mask_shape = (1, T, T) + (1,) * n_spatial
+    mask = jnp.tril(jnp.ones((T, T), dtype=bool)).reshape(mask_shape)
+    # Zero upper triangle BEFORE exp to prevent overflow → NaN in backward pass
+    # (exp of large positive in upper triangle → inf, and 0 * inf = NaN in gradient)
+    log_decay = jnp.where(mask, log_decay, jnp.zeros_like(log_decay))
+    M = jnp.where(mask, jnp.exp(log_decay), jnp.zeros_like(log_decay))
+
+    # Y[t] = sum_s M[t,s] * X[s]  (contraction over source time axis=2)
+    X_expand = X[:, None, :]  # (B, 1, T, ...)
+    Y = jnp.sum(M * X_expand, axis=2)
+    return Y
+
+
+def chunked_quadratic_scan(A, X, chunk_size=8):
+    """Chunked quadratic scan for longer sequences.
+
+    Uses L×L quadratic attention within chunks plus inter-chunk recurrence.
+    Identical to ssd_scan mathematically but expressed as chunked attention.
+
+    Steps:
+        1. L×L quadratic form within each chunk (parallel)
+        2. Compute chunk boundary states (parallel)
+        3. Inter-chunk scan (T/L elements, short)
+        4. Correct intra-chunk outputs with boundary states (parallel)
+
+    Args:
+        A: (B, T, ...) complex decay (linear space)
+        X: (B, T, ...) complex input (linear space)
+        chunk_size: chunk size L (default 8). T must be divisible by L.
+    Returns:
+        Y: (B, T, ...) scan output
+    """
+    B_dim, T = A.shape[0], A.shape[1]
+    spatial = A.shape[2:]
+    L = chunk_size
+
+    if T <= L:
+        return quadratic_scan(A, X)
+
+    assert T % L == 0, f"T={T} must be divisible by chunk_size={L}"
+    n_chunks = T // L
+
+    # Reshape into chunks: (B, T, ...) -> (B, n_chunks, L, ...)
+    A_c = A.reshape(B_dim, n_chunks, L, *spatial)
+    X_c = X.reshape(B_dim, n_chunks, L, *spatial)
+
+    # --- Step 1: Intra-chunk via quadratic form ---
+    # Build L×L causal decay matrix per chunk
+    log_A = jnp.log(A_c + 0j)
+    log_A_cumsum = jnp.cumsum(log_A, axis=2)  # (B, nc, L, ...)
+
+    n_spatial = len(spatial)
+    expand_i = log_A_cumsum[:, :, :, None]  # (B, nc, L, 1, ...)
+    expand_j = log_A_cumsum[:, :, None, :]  # (B, nc, 1, L, ...)
+    log_decay = expand_i - expand_j  # (B, nc, L, L, ...)
+
+    mask_shape = (1, 1, L, L) + (1,) * n_spatial
+    mask = jnp.tril(jnp.ones((L, L), dtype=bool)).reshape(mask_shape)
+    # Zero upper triangle BEFORE exp to prevent overflow → NaN in backward pass
+    log_decay = jnp.where(mask, log_decay, jnp.zeros_like(log_decay))
+    M = jnp.where(mask, jnp.exp(log_decay), jnp.zeros_like(log_decay))
+
+    # Intra-chunk output: Y_diag[b,c,i,...] = sum_j M[b,c,i,j,...] * X[b,c,j,...]
+    X_expand = X_c[:, :, None, :]  # (B, nc, 1, L, ...)
+    Y_diag = jnp.sum(M * X_expand, axis=3)  # (B, nc, L, ...)
+
+    # --- Step 2: Chunk boundary states ---
+    last_cumsum = log_A_cumsum[:, :, -1:]  # (B, nc, 1, ...)
+    decay_to_end = jnp.exp(last_cumsum - log_A_cumsum)  # (B, nc, L, ...)
+    chunk_states = jnp.sum(decay_to_end * X_c, axis=2)  # (B, nc, ...)
+    chunk_decay = jnp.exp(log_A_cumsum[:, :, -1])  # (B, nc, ...)
+
+    # --- Step 3: Inter-chunk scan ---
+    _, propagated = jax.lax.associative_scan(
+        _ssd_scalar_scan_op, (chunk_decay, chunk_states), axis=1
+    )
+    # State entering chunk c = propagated[c-1], zeros for chunk 0
+    zeros = jnp.zeros_like(propagated[:, :1])
+    boundary_states = jnp.concatenate([zeros, propagated[:, :-1]], axis=1)
+
+    # --- Step 4: Correct intra-chunk outputs with boundary states ---
+    decay_from_start = jnp.exp(log_A_cumsum)  # (B, nc, L, ...)
+    Y_off = boundary_states[:, :, None] * decay_from_start  # (B, nc, L, ...)
 
     Y = (Y_diag + Y_off).reshape(B_dim, T, *spatial)
     return Y

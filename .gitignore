@@ -1,6 +1,9 @@
 *.png
 *.npz
 *.npy
+*.pdf
+
+visualizations
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -129,3 +132,4 @@ temp/
 *.pem
 *.key
 credentials.json
+CLAUDE.md

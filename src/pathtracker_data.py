@@ -278,8 +278,8 @@ def get_pathtracker_datasets(
     image_size: int = 32,
     num_frames: int = 8,
     total_frames: int = 64,
-    train_size: int = 100000,
-    test_size: int = 10000,
+    train_size: int = 20000,
+    test_size: int = 2000,
     seed: int = 42,
 ) -> Tuple[PathTrackerSubset, PathTrackerSubset, PathTrackerSubset]:
     """
@@ -310,26 +310,16 @@ def get_pathtracker_datasets(
     n_total = len(full_dataset)
     rng = np.random.RandomState(seed)
 
-    # Split per-class by sorted index order:
-    # Dataset is ordered as [all class 0, all class 1] sorted by sample number.
-    # Per class: first train_per_class for train, last test_per_class for test.
-    labels = np.array([full_dataset.files[i][1] for i in range(n_total)])
-    class_0 = np.where(labels == 0)[0]
-    class_1 = np.where(labels == 1)[0]
+    # Random split (matches TFRecord conversion script):
+    # Shuffle all indices, then carve train/test/val.
+    indices = np.arange(n_total)
+    rng.shuffle(indices)
 
-    train_per_class = train_size // 2
-    test_per_class = test_size // 2
+    train_size = min(train_size, n_total)
+    test_size = min(test_size, n_total - train_size)
 
-    # Cap to available samples per class
-    train_per_class = min(train_per_class, len(class_0) - test_per_class)
-    test_per_class = min(test_per_class, len(class_0) - train_per_class)
-
-    # Per-class split: first N = train, last M = test
-    train_indices = np.concatenate([class_0[:train_per_class], class_1[:train_per_class]])
-    test_indices = np.concatenate([class_0[-test_per_class:], class_1[-test_per_class:]])
-
-    # Shuffle train indices (test stays fixed)
-    rng.shuffle(train_indices)
+    train_indices = indices[:train_size]
+    test_indices = indices[train_size:train_size + test_size]
 
     # Carve val from train (last 10%)
     n_val = max(1, len(train_indices) // 10)
@@ -350,8 +340,8 @@ def get_pathtracker_loader(
     image_size: int = 32,
     total_frames: int = 64,
     split: str = 'train',
-    train_size: int = 100000,
-    test_size: int = 10000,
+    train_size: int = 20000,
+    test_size: int = 2000,
     seed: int = 42,
     shuffle: bool = True,
     num_workers: int = 0,
@@ -419,8 +409,8 @@ def get_pathtracker_loader(
 
 def get_pathtracker_info(
     root: str = '/media/data_cifs/projects/prj_video_datasets/pathtracker',
-    train_size: int = 100000,
-    test_size: int = 10000,
+    train_size: int = 20000,
+    test_size: int = 2000,
 ) -> dict:
     """Get dataset metadata.
 
@@ -482,7 +472,17 @@ class PathTrackerTFRecordLoader:
     """
     Fast TFRecord-based data loader for PathTracker videos.
 
-    Requires pre-conversion using scripts/convert_pathtracker_tfrecords.py
+    Supports two TFRecord formats:
+      1. "Legacy" format (from convert_pathtracker_tfrecords.py):
+         - Shards in split subdirs: {tfrecord_dir}/{split}/shard_NNNN.tfrecord
+         - Features: video (float32 bytes), label (int64), num_frames, height, width, channels
+         - Pre-normalized (ImageNet mean/std already applied)
+         - No compression
+      2. "New" format (from PathTracker paper data):
+         - Flat dir with named shards: {split}-batch_N--NNNNN-of-NNNNN
+         - Features: image (uint8 bytes), label (bytes, 1 byte), height (int64), width (int64)
+         - Raw uint8, normalized on the fly
+         - GZIP compressed
     """
 
     def __init__(
@@ -503,18 +503,87 @@ class PathTrackerTFRecordLoader:
         self.num_frames = num_frames
         self.total_frames = total_frames
         self.shuffle = shuffle
-
-        # Precompute frame subsampling indices
-        self.frame_indices = np.round(np.linspace(0, total_frames - 1, num_frames)).astype(int)
+        self.image_size = 32
 
         tfrecord_path = Path(tfrecord_dir)
+        self.format = self._detect_format(tfrecord_path, split)
+        print(f"  PathTracker TFRecord format: {self.format}")
+
+        if self.format == 'new':
+            self._init_new_format(tfrecord_path, split)
+        else:
+            self._init_legacy_format(tfrecord_path, split)
+
+        if num_frames > self.n_frames_stored:
+            raise ValueError(
+                f"--seq_len {num_frames} > {self.n_frames_stored} frames stored in TFRecords. "
+                f"Use --seq_len {self.n_frames_stored} or less."
+            )
+        self.frame_indices = np.round(np.linspace(0, self.n_frames_stored - 1, num_frames)).astype(int)
+
+        self.dataset = self._create_dataset(shuffle_buffer, prefetch_batches)
+
+    def _detect_format(self, tfrecord_path: Path, split: str) -> str:
+        """Auto-detect TFRecord format based on file structure."""
+        # New format: flat dir with files like "train-batch_0--00000-of-00040"
+        split_prefix = 'train' if split == 'train' else 'test'
+        new_files = sorted(tfrecord_path.glob(f'{split_prefix}-batch_*'))
+        if new_files:
+            return 'new'
+
+        # Legacy format: split subdirectory with shard_NNNN.tfrecord
+        shard_dir = tfrecord_path / split
+        if shard_dir.exists() and list(shard_dir.glob('*.tfrecord')):
+            return 'legacy'
+
+        # Try new format with 'val' mapped to 'test'
+        if split == 'val':
+            new_files = sorted(tfrecord_path.glob('test-batch_*'))
+            if new_files:
+                return 'new'
+
+        raise ValueError(
+            f"No TFRecord files found in {tfrecord_path} for split '{split}'. "
+            f"Expected either flat files like 'train-batch_*' or subdir '{split}/shard_*.tfrecord'"
+        )
+
+    def _init_new_format(self, tfrecord_path: Path, split: str):
+        """Initialize for new gzipped format with image/label features."""
+        split_prefix = 'train' if split in ('train', 'val') else 'test'
+        self.shard_paths = sorted(tfrecord_path.glob(f'{split_prefix}-batch_*'))
+        self.compression = 'GZIP'
+
+        # Probe to get frame count and sample count
+        ds = tf.data.TFRecordDataset([str(self.shard_paths[0])], compression_type='GZIP')
+        raw = next(iter(ds))
+        ex = tf.train.Example()
+        ex.ParseFromString(raw.numpy())
+        image_bytes = ex.features.feature['image'].bytes_list.value[0]
+        h = ex.features.feature['height'].int64_list.value[0]
+        w = ex.features.feature['width'].int64_list.value[0]
+        self.image_size = h
+        n_pixels = len(image_bytes)  # uint8
+        self.n_frames_stored = n_pixels // (h * w * 3)
+        print(f"  New format: {self.n_frames_stored} frames, {h}x{w}, {len(self.shard_paths)} shards")
+
+        # Count samples
+        total = 0
+        for raw in tf.data.TFRecordDataset([str(p) for p in self.shard_paths], compression_type='GZIP'):
+            total += 1
+        self.n_samples = total
+
+        # For val split, use last 10% of training data
+        if split == 'val':
+            n_val = max(1, self.n_samples // 10)
+            self.n_samples = n_val
+            print(f"  Val split: using {n_val} samples from training shards")
+
+    def _init_legacy_format(self, tfrecord_path: Path, split: str):
+        """Initialize for legacy format with video/label features."""
         shard_dir = tfrecord_path / split
         metadata_path = tfrecord_path / 'metadata.json'
-
         self.shard_paths = sorted(shard_dir.glob('*.tfrecord'))
-
-        if len(self.shard_paths) == 0:
-            raise ValueError(f"No TFRecord shards found in {shard_dir}")
+        self.compression = None
 
         if metadata_path.exists():
             import json
@@ -525,10 +594,9 @@ class PathTrackerTFRecordLoader:
             self.n_frames_stored = metadata.get('num_frames', 64)
         else:
             self.n_samples = len(self.shard_paths) * 1000
-            self.image_size = 32
             self.n_frames_stored = 64
 
-        # Probe first record to verify frame count matches metadata
+        # Probe first record to verify
         try:
             raw = next(iter(tf.data.TFRecordDataset([str(self.shard_paths[0])])))
             parsed = tf.io.parse_single_example(raw, {
@@ -536,18 +604,40 @@ class PathTrackerTFRecordLoader:
             })
             n_bytes = len(parsed['video'].numpy())
             pixels_per_frame = self.image_size * self.image_size * 3
-            probed_frames = n_bytes // (pixels_per_frame * 4)  # 4 bytes per float32
+            probed_frames = n_bytes // (pixels_per_frame * 4)
             if probed_frames != self.n_frames_stored:
                 print(f"  WARNING: metadata says {self.n_frames_stored} frames, "
                       f"actual data has {probed_frames}. Using {probed_frames}.")
                 self.n_frames_stored = probed_frames
         except Exception:
-            pass  # Fall back to metadata
+            pass
 
-        self.dataset = self._create_dataset(shuffle_buffer, prefetch_batches)
+    def _parse_example_new(self, serialized):
+        """Parse new format: image (uint8), label (bytes)."""
+        features = {
+            'image': tf.io.FixedLenFeature([], tf.string),
+            'label': tf.io.FixedLenFeature([], tf.string),
+            'height': tf.io.FixedLenFeature([], tf.int64),
+            'width': tf.io.FixedLenFeature([], tf.int64),
+        }
+        example = tf.io.parse_single_example(serialized, features)
 
-    def _parse_example(self, serialized):
-        """Parse a single TFRecord example."""
+        image = tf.io.decode_raw(example['image'], tf.uint8)
+        image = tf.reshape(image, [self.n_frames_stored, self.image_size, self.image_size, 3])
+
+        # Normalize: uint8 -> float32, ImageNet mean/std
+        video = tf.cast(image, tf.float32) / 255.0
+        mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
+        std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
+        video = (video - mean) / std
+
+        label = tf.io.decode_raw(example['label'], tf.uint8)
+        label = tf.cast(label[0], tf.int32)
+
+        return video, label
+
+    def _parse_example_legacy(self, serialized):
+        """Parse legacy format: video (float32), label (int64)."""
         features = {
             'video': tf.io.FixedLenFeature([], tf.string),
             'label': tf.io.FixedLenFeature([], tf.int64),
@@ -572,8 +662,12 @@ class PathTrackerTFRecordLoader:
         if self.shuffle:
             files = files.shuffle(len(self.shard_paths))
 
+        compression = self.compression
         dataset = files.interleave(
-            lambda x: tf.data.TFRecordDataset(x, buffer_size=8 * 1024 * 1024),
+            lambda x: tf.data.TFRecordDataset(
+                x, buffer_size=8 * 1024 * 1024,
+                compression_type=compression or '',
+            ),
             cycle_length=min(8, len(self.shard_paths)),
             num_parallel_calls=tf.data.AUTOTUNE,
             deterministic=False,
@@ -582,8 +676,9 @@ class PathTrackerTFRecordLoader:
         if self.shuffle:
             dataset = dataset.shuffle(shuffle_buffer)
 
+        parse_fn = self._parse_example_new if self.format == 'new' else self._parse_example_legacy
         dataset = dataset.map(
-            self._parse_example,
+            parse_fn,
             num_parallel_calls=tf.data.AUTOTUNE,
             deterministic=False,
         )
@@ -595,13 +690,37 @@ class PathTrackerTFRecordLoader:
     def __len__(self):
         return self.n_samples // self.batch_size
 
-    def __iter__(self):
-        for videos, labels in self.dataset:
-            # Subsample frames: (B, 64, H, W, 3) -> (B, num_frames, H, W, 3)
-            videos_np = videos.numpy()
-            videos_sub = videos_np[:, self.frame_indices]
+    def _tf_to_jax_worker(self, queue: Queue, stop_event: threading.Event):
+        """Background thread: converts TF tensors to JAX arrays."""
+        try:
+            for videos, labels in self.dataset:
+                if stop_event.is_set():
+                    break
+                videos_np = videos.numpy()
+                videos_sub = videos_np[:, self.frame_indices]
+                queue.put((jnp.array(videos_sub), jnp.array(labels.numpy())))
+        except Exception as e:
+            print(f"TFRecord prefetch error: {e}")
+        queue.put(None)  # Sentinel
 
-            yield jnp.array(videos_sub), jnp.array(labels.numpy())
+    def __iter__(self):
+        queue = Queue(maxsize=4)
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=self._tf_to_jax_worker,
+            args=(queue, stop_event),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            while True:
+                batch = queue.get()
+                if batch is None:
+                    break
+                yield batch
+        finally:
+            stop_event.set()
+            worker.join(timeout=2.0)
 
 
 def get_pathtracker_tfrecord_loader(

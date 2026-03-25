@@ -14,16 +14,17 @@ Training features:
 """
 
 # =============================================================================
-# IMPORTANT: Configure TensorFlow to use CPU-only BEFORE importing it
-# This prevents TensorFlow (used for TFRecord data loading) from conflicting
-# with JAX's NCCL for multi-GPU training.
-# On Blackwell (compute capability 10.0), TF's C++ runtime tries to JIT-compile
-# kernels from PTX on import, which takes 30+ minutes. Hiding GPUs via
-# TF_VISIBLE_DEVICES prevents this probe entirely.
+# IMPORTANT: Configure TensorFlow and NCCL BEFORE importing anything
+# 1. TF_CPP_MIN_LOG_LEVEL=3: Suppress TF C++ logs (including B200 PTX warnings)
+# 2. TF_FORCE_GPU_ALLOW_GROWTH: Prevent TF from preallocating GPU memory
+# 3. NCCL_RAS_ENABLE=0: Disable NCCL RAS monitoring (binds localhost:28028).
+#    Without this, multiple NCCL jobs on the same node get "Address already in
+#    use" and corrupted communicator objects. See NVIDIA/nccl#1669.
 # =============================================================================
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress ALL TF C++ logs
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Don't preallocate if TF does use GPU
+os.environ.setdefault('NCCL_RAS_ENABLE', '0')  # Prevent NCCL RAS socket conflicts
 # =============================================================================
 
 import argparse
@@ -75,7 +76,7 @@ class SimpleCheckpointer:
     unpicklable closures from optax.apply_if_finite).
     """
 
-    def save(self, path: str, state: Any) -> None:
+    def save(self, path: str, state: Any, training_args: dict = None) -> None:
         """Save state to pickle file (only picklable parts)."""
         os.makedirs(path, exist_ok=True)
 
@@ -94,6 +95,8 @@ class SimpleCheckpointer:
             'epoch': int(state.epoch) if hasattr(state.epoch, 'item') else state.epoch,
             'step': int(state.step) if hasattr(state.step, 'item') else state.step,
         }
+        if training_args is not None:
+            checkpoint_data['training_args'] = training_args
         if hasattr(state, 'batch_stats') and state.batch_stats is not None:
             checkpoint_data['batch_stats'] = jax.tree_util.tree_map(to_numpy, state.batch_stats)
 
@@ -145,33 +148,23 @@ from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet
 
 # =============================================================================
 # Configure TensorFlow to use CPU only BEFORE importing data loaders.
-# On Blackwell GPUs (compute capability 10.0), TF's C++ runtime tries to
-# JIT-compile CUDA kernels from PTX on import (~30 min). We hide GPUs via
-# CUDA_VISIBLE_DEVICES BEFORE importing TF (and before JAX creates a CUDA
-# context) so TF never sees the GPUs. Then we restore CUDA_VISIBLE_DEVICES
-# before JAX initializes.
+# Initialize JAX first so it claims the CUDA context, then import TF and
+# hide GPUs from it. Do NOT manipulate CUDA_VISIBLE_DEVICES — that corrupts
+# NCCL's device ordinals and causes "invalid device ordinal" errors under pmap.
 # =============================================================================
-_saved_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
-os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Hide GPUs from TF
+_ = jax.devices()  # Force JAX to initialize CUDA backend first
 try:
     import tensorflow as tf
-    tf.config.set_visible_devices([], 'GPU')
+    tf.config.set_visible_devices([], 'GPU')  # Hide GPUs from TF (CPU-only I/O)
 except ImportError:
     pass  # TensorFlow not installed
 except RuntimeError:
     pass  # Devices already initialized
-finally:
-    # Restore CUDA_VISIBLE_DEVICES so JAX can see GPUs when it initializes
-    if _saved_cuda_visible is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = _saved_cuda_visible
-    else:
-        del os.environ['CUDA_VISIBLE_DEVICES']
-# Now force JAX to initialize its CUDA backend (with correct GPU visibility)
-_ = jax.devices()
 
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 from src.cabc_data import get_cabc_loader, get_cabc_info, get_cabc_tfrecord_loader
 from src.pathtracker_data import get_pathtracker_loader, get_pathtracker_info, get_pathtracker_tfrecord_loader
+from src.girik_data import get_girik_info, get_girik_tfrecord_loader
 
 
 # Multi-GPU utilities
@@ -223,6 +216,7 @@ def create_train_state(
     warmup_steps: int = 500,
     grad_clip: float = 1.0,
     image_size: int = 224,
+    optimizer: str = 'adamw',
 ) -> Tuple[TrainState, optax.GradientTransformation]:
     """
     Initialize training state with optimizer and LR schedule.
@@ -236,6 +230,7 @@ def create_train_state(
         warmup_steps: Number of warmup steps
         grad_clip: Maximum gradient norm
         image_size: Input image spatial size
+        optimizer: 'adamw' or 'muon'
 
     Returns:
         Tuple of (train_state, optimizer)
@@ -256,11 +251,19 @@ def create_train_state(
         end_value=learning_rate * 0.01,
     )
 
-    # Optimizer: AdamW with gradient clipping
-    tx = optax.chain(
-        optax.clip_by_global_norm(grad_clip),
-        optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
-    )
+    # Optimizer selection
+    if optimizer == 'muon':
+        # Muon: Newton-Schulz orthogonalized momentum for 2D weights, AdamW for rest
+        tx = optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.contrib.muon(learning_rate=schedule, weight_decay=weight_decay),
+        )
+    else:
+        # AdamW with gradient clipping (default)
+        tx = optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
+        )
 
     # Wrap with apply_if_finite to skip updates on NaN/Inf gradients
     # This prevents NaN propagation and helps debug where instability originates
@@ -277,13 +280,14 @@ def create_train_state(
     return state, tx, schedule
 
 
-@partial(jax.jit, static_argnums=(3, 4))
+@partial(jax.jit, static_argnums=(3, 4, 5))
 def train_step(
     state: TrainState,
     batch: Tuple[jnp.ndarray, jnp.ndarray],
     rng: jax.Array,
     num_classes: int,
     has_batch_stats: bool = False,
+    label_smoothing: float = 0.0,
 ) -> Tuple[TrainState, Dict[str, float]]:
     """
     Single training step.
@@ -294,6 +298,7 @@ def train_step(
         rng: Random key for dropout
         num_classes: Number of output classes
         has_batch_stats: Whether model uses BatchNorm
+        label_smoothing: Label smoothing epsilon (0=none)
 
     Returns:
         Tuple of (updated_state, metrics_dict)
@@ -302,6 +307,9 @@ def train_step(
     reducing memory allocation overhead.
     """
     videos, labels = batch
+    targets = jax.nn.one_hot(labels, num_classes)
+    if label_smoothing > 0:
+        targets = targets * (1 - label_smoothing) + label_smoothing / num_classes
 
     def loss_fn(params, batch_stats):
         variables = {'params': params}
@@ -315,7 +323,7 @@ def train_step(
                 mutable=['batch_stats'],
             )
             return optax.softmax_cross_entropy(
-                output, jax.nn.one_hot(labels, num_classes)
+                output, targets
             ).mean(), (output, mutated['batch_stats'])
         else:
             logits = state.apply_fn(
@@ -325,7 +333,7 @@ def train_step(
                 rngs={'dropout': rng},
             )
             return optax.softmax_cross_entropy(
-                logits, jax.nn.one_hot(labels, num_classes)
+                logits, targets
             ).mean(), (logits, None)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -347,12 +355,14 @@ def train_step(
     return state, metrics
 
 
-@partial(jax.jit, static_argnums=(2, 3))
+@partial(jax.jit, static_argnums=(2, 3, 4, 5))
 def eval_step(
     state: TrainState,
     batch: Tuple[jnp.ndarray, jnp.ndarray],
     num_classes: int,
     has_batch_stats: bool = False,
+    label_smoothing: float = 0.0,
+    bn_train_mode: bool = False,
 ) -> Dict[str, float]:
     """
     Single evaluation step.
@@ -362,6 +372,8 @@ def eval_step(
         batch: Tuple of (videos, labels)
         num_classes: Number of output classes
         has_batch_stats: Whether model uses BatchNorm
+        label_smoothing: Label smoothing epsilon (0=none)
+        bn_train_mode: Use batch stats during eval (training=True for BN)
 
     Returns:
         Dictionary of metrics
@@ -372,14 +384,24 @@ def eval_step(
     if has_batch_stats:
         variables['batch_stats'] = state.batch_stats
 
-    logits = state.apply_fn(
-        variables,
-        videos,
-        training=False,
-    )
+    if bn_train_mode and has_batch_stats:
+        logits, _ = state.apply_fn(
+            variables,
+            videos,
+            training=True,
+            mutable=['batch_stats'],
+        )
+    else:
+        logits = state.apply_fn(
+            variables,
+            videos,
+            training=False,
+        )
 
-    one_hot = jax.nn.one_hot(labels, num_classes)
-    loss = optax.softmax_cross_entropy(logits, one_hot).mean()
+    targets = jax.nn.one_hot(labels, num_classes)
+    if label_smoothing > 0:
+        targets = targets * (1 - label_smoothing) + label_smoothing / num_classes
+    loss = optax.softmax_cross_entropy(logits, targets).mean()
     acc = jnp.mean(jnp.argmax(logits, -1) == labels)
 
     return {
@@ -394,6 +416,8 @@ def evaluate(
     num_classes: int,
     num_batches: int = None,
     has_batch_stats: bool = False,
+    label_smoothing: float = 0.0,
+    bn_train_mode: bool = False,
 ) -> Dict[str, float]:
     """
     Run full validation evaluation.
@@ -404,6 +428,8 @@ def evaluate(
         num_classes: Number of output classes
         num_batches: Max batches to evaluate (None = all)
         has_batch_stats: Whether model uses BatchNorm
+        label_smoothing: Label smoothing epsilon (0=none)
+        bn_train_mode: Use batch stats during eval (training=True for BN)
 
     Returns:
         Dictionary of averaged metrics
@@ -416,7 +442,7 @@ def evaluate(
         if num_batches is not None and i >= num_batches:
             break
 
-        metrics = eval_step(state, batch, num_classes, has_batch_stats)
+        metrics = eval_step(state, batch, num_classes, has_batch_stats, label_smoothing, bn_train_mode)
         batch_size = batch[0].shape[0]
         total_loss += float(metrics['val_loss']) * batch_size
         total_acc += float(metrics['val_acc']) * batch_size
@@ -430,11 +456,14 @@ def evaluate(
 
 # Multi-GPU versions using pmap
 # Pattern matched to working ImageNet training in src/training/distributed.py
-def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False):
+def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False, label_smoothing: float = 0.0):
     """Create pmap'd train step for multi-GPU training."""
 
     def train_step_pmap(state, batch, rng):
         videos, labels = batch
+        targets = jax.nn.one_hot(labels, num_classes)
+        if label_smoothing > 0:
+            targets = targets * (1 - label_smoothing) + label_smoothing / num_classes
 
         def loss_fn(params, batch_stats):
             variables = {'params': params}
@@ -448,7 +477,7 @@ def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False):
                     mutable=['batch_stats'],
                 )
                 return optax.softmax_cross_entropy(
-                    output, jax.nn.one_hot(labels, num_classes)
+                    output, targets
                 ).mean(), (output, mutated['batch_stats'])
             else:
                 logits = state.apply_fn(
@@ -458,7 +487,7 @@ def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False):
                     rngs={'dropout': rng},
                 )
                 return optax.softmax_cross_entropy(
-                    logits, jax.nn.one_hot(labels, num_classes)
+                    logits, targets
                 ).mean(), (logits, None)
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -490,7 +519,7 @@ def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False):
     return jax.pmap(train_step_pmap, axis_name='batch', donate_argnums=(0,))
 
 
-def create_pmap_eval_step(num_classes: int, has_batch_stats: bool = False):
+def create_pmap_eval_step(num_classes: int, has_batch_stats: bool = False, label_smoothing: float = 0.0, bn_train_mode: bool = False):
     """Create pmap'd eval step for multi-GPU evaluation."""
 
     def eval_step_pmap(state, batch):
@@ -500,14 +529,24 @@ def create_pmap_eval_step(num_classes: int, has_batch_stats: bool = False):
         if has_batch_stats:
             variables['batch_stats'] = state.batch_stats
 
-        logits = state.apply_fn(
-            variables,
-            videos,
-            training=False,
-        )
+        if bn_train_mode and has_batch_stats:
+            logits, _ = state.apply_fn(
+                variables,
+                videos,
+                training=True,
+                mutable=['batch_stats'],
+            )
+        else:
+            logits = state.apply_fn(
+                variables,
+                videos,
+                training=False,
+            )
 
-        one_hot = jax.nn.one_hot(labels, num_classes)
-        loss = optax.softmax_cross_entropy(logits, one_hot).mean()
+        targets = jax.nn.one_hot(labels, num_classes)
+        if label_smoothing > 0:
+            targets = targets * (1 - label_smoothing) + label_smoothing / num_classes
+        loss = optax.softmax_cross_entropy(logits, targets).mean()
         acc = jnp.mean(jnp.argmax(logits, -1) == labels)
 
         # Average across devices
@@ -575,9 +614,9 @@ def main():
 
     # CSSM configuration
     parser.add_argument('--cssm', type=str,
-                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1'],
+                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm'],
                         default='hgru_bi',
-                        help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan)')
+                        help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan), add_delta (delta-enhanced 3-state), deltanet (spectral DeltaNet), deltanet_d2 (matrix DeltaNet d_k=2), deltanet_d3 (matrix DeltaNet d_k=3), gdn (gated DeltaNet d_k=2), gdn_d2 (gated DeltaNet d_k=2), gdn_d3 (gated DeltaNet d_k=3)')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
                         help='Mixing type: dense (multi-head) or depthwise')
     parser.add_argument('--no_concat_xy', action='store_true',
@@ -620,7 +659,9 @@ def main():
     parser.add_argument('--position_independent_gates', action='store_true',
                         help='[cssm] Compute gates from raw input (before position encoding) for better length generalization')
     parser.add_argument('--no_goom', action='store_true',
-                        help='[mult_transformer] Disable GOOM (complex log) - assumes positive inputs, faster but less flexible')
+                        help='Disable GOOM primitives for log-space scan (use standard log/exp instead)')
+    parser.add_argument('--no_log', action='store_true',
+                        help='Disable log-space scan entirely (direct complex multiply). Can combine with --use_complex32 for bfloat16 precision.')
     parser.add_argument('--gate_type', type=str, default='dense',
                         choices=['dense', 'channel', 'scalar', 'conv', 'dense_decay', 'dense_io',
                                  'factored', 'spectral_conv', 'low_rank'],
@@ -631,10 +672,61 @@ def main():
                         help='[add_kqv] Learn initial state for CSSM recurrence instead of starting from zero')
     parser.add_argument('--use_complex32', action='store_true',
                         help='[add_kqv] Phase-split scan: bf16 mag + bf16 phase (halves scan memory, faster compile)')
+    parser.add_argument('--use_complex16', action='store_true',
+                        help='[add_kqv] FP8 scan: float8 real + float8 imag (quarter memory vs complex64)')
     parser.add_argument('--use_ssd', action='store_true',
-                        help='[add_kqv] Use SSD chunked scan (Mamba-2 algorithm) instead of associative scan')
+                        help='[add_kqv] Use SSD chunked scan (legacy, prefer --scan_mode ssd)')
+    parser.add_argument('--scan_mode', type=str, default='associative',
+                        choices=['associative', 'ssd', 'quadratic', 'pallas'],
+                        help='[add_kqv] Scan algorithm: associative (log-space), ssd (chunked Mamba-2), quadratic (T×T attention form), pallas (fused GPU kernel)')
     parser.add_argument('--ssd_chunk_size', type=int, default=8,
-                        help='[add_kqv] Chunk size for SSD scan (default: 8)')
+                        help='[add_kqv] Chunk size for SSD / chunked quadratic scan (default: 8)')
+    # Spatial attention (SpatialAttentionCSSM) config
+    parser.add_argument('--mlp_ratio', type=float, default=4.0,
+                        help='[spatial_attn] MLP expansion ratio')
+    parser.add_argument('--drop_path_rate', type=float, default=0.0,
+                        help='[spatial_attn] Stochastic depth drop rate')
+    # GatedDeltaNetCSSM (gdn) config
+    parser.add_argument('--short_conv_size', type=int, default=4,
+                        help='[gdn] Temporal short conv kernel size (0=disabled)')
+    parser.add_argument('--output_norm', type=str, default='rms',
+                        choices=['rms', 'layer', 'none'],
+                        help='[gdn] Output norm before gating')
+    parser.add_argument('--no_input_gates', action='store_true',
+                        help='[gdn] Disable B_k/B_v input gates')
+    parser.add_argument('--output_gate_act', type=str, default='silu',
+                        choices=['silu', 'sigmoid'],
+                        help='[gdn] Output gate activation')
+    parser.add_argument('--no_spectral_l2_norm', action='store_true',
+                        help='[gdn] Disable L2 normalization of q,k across freq bins')
+    parser.add_argument('--qkv_conv_size', type=int, default=1,
+                        help='[gdn] QKV projection spatial extent (1=Dense/pointwise, 3/5/7=spatial conv for one-shot cross-freq coupling)')
+    parser.add_argument('--qkv_conv_full', action='store_true',
+                        help='[gdn] Use full (non-separable) conv for QKV projection (default: depthwise-separable)')
+    parser.add_argument('--cross_freq_conv_size', type=int, default=0,
+                        help='[gdn] 1D conv across freq bins on output (0=disabled, 3/5=cross-freq mixing per timestep)')
+    parser.add_argument('--delta_key_dim', type=int, default=2,
+                        help='[gdn] Key dimension d_k (2 or 3). Only used with --cssm gdn; gdn_d2/gdn_d3 override this.')
+    parser.add_argument('--no_spectral_clamp', action='store_true',
+                        help='[gdn] Disable spectral magnitude squash on spatial kernel W_hat (allows |W_hat| >= 1, may be unstable)')
+    parser.add_argument('--inter_mlp_ratio', type=float, default=0.0,
+                        help='Channel-mixing MLP expansion ratio between CSSM blocks (0=disabled, 2.0=typical). Only used when depth > 1.')
+    parser.add_argument('--attn_kernel_size', type=int, default=7,
+                        help='[gdn_int] Spatial kernel size for spectral InT attention state')
+    parser.add_argument('--int_attn_dim', type=int, default=16,
+                        help='[gdn_int_qk] Hidden dim for Q·K attention projections')
+    # Mamba2SeqCSSM / GDNSeqCSSM / ConvSSMCSSM config
+    parser.add_argument('--state_dim', type=int, default=16,
+                        help='[mamba2_seq] SSM state dimension N (default: 16)')
+    parser.add_argument('--expand_factor', type=int, default=2,
+                        help='[mamba2_seq] Inner dimension expansion factor (default: 2)')
+    parser.add_argument('--flatten_mode', type=str, default='temporal_spatial',
+                        choices=['temporal_spatial', 'per_frame'],
+                        help='[mamba2_seq/gdn_seq] How to flatten 5D to 1D: temporal_spatial (T*H*W) or per_frame (H*W per frame)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Label smoothing epsilon (0=none, 0.1=typical)')
+    parser.add_argument('--bn_train_mode', action='store_true',
+                        help='Use batch statistics (training=True) for BatchNorm even during eval')
     # Ablation flags for g_transformer and mg_transformer
     parser.add_argument('--shared_kernel', action='store_true',
                         help='[g_transformer/mg_transformer] Use 1 shared kernel for Q/K/V instead of separate kernels')
@@ -688,8 +780,8 @@ def main():
                         choices=['last', 'all'],
                         help='[simple] Use last frame or all frames for readout')
     parser.add_argument('--pos_embed', type=str, default='spatiotemporal',
-                        choices=['spatiotemporal', 'spatial_only', 'separate', 'sinusoidal', 'temporal', 'learnable', 'none'],
-                        help='[simple] Position embedding type: spatiotemporal (VideoRoPE), spatial_only (no temporal), separate (spatial RoPE + learned temporal), sinusoidal (spatial RoPE + sinusoidal temporal, best length extrapolation), temporal, learnable, or none')
+                        choices=['spatiotemporal', 'mrope', 'spatial_only', 'separate', 'sinusoidal', 'temporal', 'learnable', 'none'],
+                        help='[simple] Position embedding type: spatiotemporal (VideoRoPE, additive), mrope (Qwen3.5 MRoPE, dedicated dims per axis), spatial_only (no temporal), separate (spatial RoPE + learned temporal), sinusoidal (spatial RoPE + sinusoidal temporal), temporal, learnable, or none')
     parser.add_argument('--act_type', type=str, default='softplus',
                         choices=['softplus', 'gelu', 'relu'],
                         help='[simple] Nonlinearity type in stem and readout')
@@ -697,13 +789,13 @@ def main():
                         choices=['mean', 'max'],
                         help='[simple] Final spatial/spatiotemporal pooling type')
     parser.add_argument('--norm_type', type=str, default='layer',
-                        choices=['layer', 'batch', 'instance'],
+                        choices=['layer', 'batch', 'instance', 'temporal_layer', 'global_layer', 'global_instance'],
                         help='[simple] Default normalization type (overridden by --stem_norm/--body_norm)')
     parser.add_argument('--stem_norm', type=str, default='',
-                        choices=['', 'layer', 'batch', 'instance'],
+                        choices=['', 'layer', 'batch', 'instance', 'temporal_layer'],
                         help='[simple] Stem norm type (default: use --norm_type)')
     parser.add_argument('--body_norm', type=str, default='',
-                        choices=['', 'layer', 'batch', 'instance'],
+                        choices=['', 'layer', 'batch', 'instance', 'temporal_layer'],
                         help='[simple] Body/readout norm type, also used between CSSM blocks (default: use --norm_type)')
     parser.add_argument('--readout_norm', type=str, default='pre',
                         choices=['pre', 'post'],
@@ -714,7 +806,7 @@ def main():
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size per device')
+                        help='Global batch size (split across devices for multi-GPU)')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers (0=sequential)')
     parser.add_argument('--prefetch_batches', type=int, default=2,
@@ -729,12 +821,17 @@ def main():
                         help='[simple] Maximum sequence length for learned temporal embeddings (used with pos_embed=separate)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
+    parser.add_argument('--early_stopping_patience', type=int, default=10,
+                        help='Stop training if val_acc does not improve for this many epochs (0=disabled)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Peak learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay coefficient')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping norm')
+    parser.add_argument('--optimizer', type=str, default='adamw',
+                        choices=['adamw', 'muon'],
+                        help='Optimizer: adamw (default) or muon (Newton-Schulz orthogonalized momentum)')
     parser.add_argument('--force_multi_gpu', action='store_true',
                         help='Force multi-GPU even if NCCL test fails')
 
@@ -759,14 +856,16 @@ def main():
                         help='Evaluate every N epochs')
     parser.add_argument('--save_every', type=int, default=5,
                         help='Save checkpoint every N epochs')
-    parser.add_argument('--save_best_only', action='store_true', default=False,
+    parser.add_argument('--save_best_only', action='store_true', default=True,
                         help='Only save checkpoint with best val loss (deletes previous best)')
+    parser.add_argument('--no_save_best_only', dest='save_best_only', action='store_false',
+                        help='Save checkpoints periodically (every --save_every epochs) instead of best-only')
     parser.add_argument('--checkpointer', type=str, default='simple',
                         choices=['simple', 'pytree', 'standard'],
                         help='Checkpointer: simple (pickle, NFS-safe), pytree (orbax), standard (orbax async)')
 
     # Data
-    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'cabc', 'imagenet', 'pathtracker'], default='imagenette',
+    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'cabc', 'imagenet', 'pathtracker', 'girik'], default='imagenette',
                         help='Dataset: imagenette, pathfinder, cabc, imagenet, or pathtracker')
     parser.add_argument('--data_dir', type=str,
                         default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
@@ -783,8 +882,8 @@ def main():
                         help='[cabc] Difficulty level (easy, medium, hard)')
     parser.add_argument('--tfrecord_dir', type=str, default=None,
                         help='[pathfinder] TFRecord directory (if set, uses TFRecord loader for max I/O perf)')
-    parser.add_argument('--image_size', type=int, default=224,
-                        help='Input image size (224 or 384 for DeiT3)')
+    parser.add_argument('--image_size', type=int, default=None,
+                        help='Input image size. Default: native resolution from dataset (no resizing). Set explicitly to resize.')
 
     # Checkpoint resume
     parser.add_argument('--resume', type=str, default=None,
@@ -877,10 +976,15 @@ def main():
     elif args.dataset == 'pathtracker':
         dataset_info = get_pathtracker_info(root=args.pathtracker_dir)
         dataset_name = "PathTracker"
-        # PathTracker: auto-set seq_len and image_size from video
-        args.seq_len = dataset_info['num_frames']
-        args.image_size = dataset_info['image_size']
-        print(f"  PathTracker: {args.seq_len} frames, {args.image_size}x{args.image_size} (auto-set)")
+        # Note: seq_len is NOT auto-set from data — always use --seq_len CLI value.
+        # The TFRecord loader handles subsampling from stored frames to num_frames.
+        # Auto-set was removed because get_pathtracker_info reads .npy files which
+        # may not match the TFRecords, causing silent frame duplication.
+        print(f"  PathTracker: --seq_len {args.seq_len} (data has {dataset_info['num_frames']} native frames)")
+    elif args.dataset == 'girik':
+        dataset_info = get_girik_info(tfrecord_dir=args.tfrecord_dir)
+        dataset_name = "Girik PathTracker"
+        print(f"  Girik: --seq_len {args.seq_len} (data has {dataset_info['num_frames']} native frames, {dataset_info['image_size']}px)")
     elif args.dataset == 'imagenet':
         dataset_info = get_imagenet_info()
         dataset_name = "ImageNet"
@@ -888,13 +992,21 @@ def main():
         dataset_info = get_dataset_info()
         dataset_name = "Imagenette"
 
+    # Resolve image_size: use native dataset resolution unless explicitly overridden
+    native_size = dataset_info.get('image_size', 224)
+    if args.image_size is None:
+        args.image_size = native_size
+        print(f"  Image size: {args.image_size}x{args.image_size} (native)")
+    elif args.image_size != native_size:
+        print(f"  Image size: {args.image_size}x{args.image_size} (resized from {native_size})")
+
     num_classes = dataset_info['num_classes']
     train_size = dataset_info['train_size']
     steps_per_epoch = train_size // args.batch_size
     total_steps = steps_per_epoch * args.epochs
 
     print(f"Dataset: {dataset_name}")
-    if args.tfrecord_dir and args.dataset in ('pathfinder', 'cabc', 'pathtracker'):
+    if args.tfrecord_dir and args.dataset in ('pathfinder', 'cabc', 'pathtracker', 'girik'):
         print(f"  Data dir: {args.tfrecord_dir} (TFRecord)")
     elif args.dataset == 'pathtracker':
         print(f"  Data dir: {args.pathtracker_dir}")
@@ -906,6 +1018,11 @@ def main():
     print(f"  Num classes: {num_classes}")
     print(f"  Steps per epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}\n")
+
+    # Warn about incompatible scan flags
+    if args.use_complex32 and not args.no_log:
+        print("WARNING: --use_complex32 has no effect with log-space scan. "
+              "Add --no_log to use bfloat16 split precision with direct scan.")
 
     # Create model based on architecture
     if args.arch == 'simple':
@@ -931,6 +1048,7 @@ def main():
             max_seq_len=args.max_seq_len,
             position_independent_gates=args.position_independent_gates,
             use_goom=not args.no_goom,
+            use_log=not args.no_log,
             stem_mode=simple_stem_mode,
             stem_layers=args.stem_layers,
             # Ablation flags for g_transformer/mg_transformer
@@ -950,8 +1068,32 @@ def main():
             n_register_tokens=args.n_register_tokens,
             learned_init=args.learned_init,
             use_complex32=args.use_complex32,
+            use_complex16=args.use_complex16,
             use_ssd=args.use_ssd,
+            scan_mode=args.scan_mode,
             ssd_chunk_size=args.ssd_chunk_size,
+            # SpatialAttentionCSSM config
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            drop_path_rate=args.drop_path_rate,
+            # GatedDeltaNetCSSM (gdn) config
+            short_conv_size=args.short_conv_size,
+            output_norm=args.output_norm,
+            use_input_gates=not args.no_input_gates,
+            output_gate_act=args.output_gate_act,
+            use_spectral_l2_norm=not args.no_spectral_l2_norm,
+            qkv_conv_size=args.qkv_conv_size,
+            qkv_conv_separable=not args.qkv_conv_full,
+            cross_freq_conv_size=args.cross_freq_conv_size,
+            delta_key_dim=args.delta_key_dim,
+            no_spectral_clamp=args.no_spectral_clamp,
+            inter_mlp_ratio=args.inter_mlp_ratio,
+            attn_kernel_size=args.attn_kernel_size,
+            int_attn_dim=args.int_attn_dim,
+            # Mamba2SeqCSSM / GDNSeqCSSM / ConvSSMCSSM config
+            state_dim=args.state_dim,
+            expand_factor=args.expand_factor,
+            flatten_mode=args.flatten_mode,
         )
     elif args.arch == 'vit':
         model = CSSMViT(
@@ -1006,6 +1148,7 @@ def main():
         warmup_steps=warmup_steps,
         grad_clip=args.grad_clip,
         image_size=args.image_size,
+        optimizer=args.optimizer,
     )
 
     # Check if model uses BatchNorm (has batch_stats)
@@ -1045,6 +1188,7 @@ def main():
     best_val_acc = 0.0
     best_val_loss = float('inf')
     best_checkpoint_path = None
+    epochs_without_improvement = 0
 
     if args.resume:
         resume_path = os.path.abspath(args.resume)
@@ -1093,18 +1237,29 @@ def main():
 
     # Create pmap'd functions for multi-GPU
     if use_multi_gpu:
-        # Test NCCL with a simple operation first
+        # Test NCCL with a simple operation first (with timeout to prevent hangs)
         print("Testing NCCL collective operations...")
         nccl_ok = False
-        try:
+        import concurrent.futures
+        def _nccl_test():
             test_data = jnp.ones((num_devices, 10), dtype=jnp.float32)
             simple_pmean = jax.pmap(lambda x: jax.lax.pmean(x, axis_name='batch'), axis_name='batch')
             result = simple_pmean(test_data)
             jax.block_until_ready(result)
+            return result
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_nccl_test)
+                result = future.result(timeout=30)  # 30s timeout
             print(f"NCCL test PASSED: pmean result shape={result.shape}, value={float(result[0, 0]):.4f}")
             nccl_ok = True
+        except concurrent.futures.TimeoutError:
+            print("NCCL test TIMED OUT after 30s (likely NCCL socket conflict)")
+            print("  Hint: another process may hold the NCCL RAS socket.")
+            print("  Try: export NCCL_RAS_ENABLE=0, or kill other NCCL processes.")
         except Exception as e:
             print(f"NCCL test FAILED: {e}")
+        if not nccl_ok:
             if args.force_multi_gpu:
                 print("--force_multi_gpu set, continuing with multi-GPU anyway...")
                 nccl_ok = True  # Force it
@@ -1116,8 +1271,8 @@ def main():
                 num_devices = 1
 
         if use_multi_gpu and nccl_ok:
-            pmap_train_step = create_pmap_train_step(num_classes, has_batch_stats)
-            pmap_eval_step = create_pmap_eval_step(num_classes, has_batch_stats)
+            pmap_train_step = create_pmap_train_step(num_classes, has_batch_stats, args.label_smoothing)
+            pmap_eval_step = create_pmap_eval_step(num_classes, has_batch_stats, args.label_smoothing, args.bn_train_mode)
             # Replicate state across devices using Flax's jax_utils (matches ImageNet training)
             state = jax_utils.replicate(state)
             print("State replicated across devices")
@@ -1135,6 +1290,7 @@ def main():
                 split='train',
                 shuffle=True,
                 prefetch_batches=args.prefetch_batches,
+                image_size=args.image_size,
             )
         else:
             train_loader = get_pathfinder_loader(
@@ -1189,6 +1345,16 @@ def main():
                 num_workers=args.num_workers,
                 prefetch_batches=args.prefetch_batches,
             )
+    elif args.dataset == 'girik':
+        train_loader = get_girik_tfrecord_loader(
+            tfrecord_dir=args.tfrecord_dir,
+            batch_size=args.batch_size,
+            num_frames=args.seq_len,
+            image_size=args.image_size,
+            split='train',
+            shuffle=True,
+            prefetch_batches=args.prefetch_batches,
+        )
     elif args.dataset == 'imagenet':
         train_loader = get_imagenet_loader(
             data_dir=args.imagenet_dir,
@@ -1206,6 +1372,12 @@ def main():
         )
 
     # Training loop
+    first_step_done = False
+    if use_multi_gpu:
+        print("\nNote: First training step triggers JIT compilation for all devices.")
+        print("This may take 2-5 minutes for scan-based models. Subsequent steps will be fast.")
+        print("(Compiled traces are cached in ~/.cache/jax_compilation_cache across runs.)\n")
+
     for epoch in range(start_epoch, args.epochs):
         # Update epoch in state
         if use_multi_gpu:
@@ -1241,6 +1413,8 @@ def main():
                     videos = videos[:, :current_seq_len]
 
                 # Time the training step
+                if not first_step_done:
+                    print("  Compiling training step (JIT)...", end='', flush=True)
                 step_start = time.perf_counter()
 
                 if use_multi_gpu:
@@ -1257,13 +1431,16 @@ def main():
                     loss_val = float(metrics['train_loss'][0])
                     acc_val = float(metrics['train_acc'][0])
                 else:
-                    state, metrics = train_step(state, batch, step_rng, num_classes, has_batch_stats)
+                    state, metrics = train_step(state, batch, step_rng, num_classes, has_batch_stats, args.label_smoothing)
                     loss_val = float(metrics['train_loss'])
                     acc_val = float(metrics['train_acc'])
 
                 # Block until computation completes for accurate timing
                 jax.block_until_ready(metrics)
                 step_time = time.perf_counter() - step_start
+                if not first_step_done:
+                    print(f" done ({step_time:.1f}s)")
+                    first_step_done = True
                 epoch_step_times.append(step_time)
 
                 epoch_loss += loss_val
@@ -1316,6 +1493,7 @@ def main():
                         split='val',
                         shuffle=False,
                         prefetch_batches=args.prefetch_batches,
+                        image_size=args.image_size,
                     )
                 else:
                     val_loader = get_pathfinder_loader(
@@ -1373,6 +1551,16 @@ def main():
                         num_workers=args.num_workers,
                         prefetch_batches=args.prefetch_batches,
                     )
+            elif args.dataset == 'girik':
+                val_loader = get_girik_tfrecord_loader(
+                    tfrecord_dir=args.tfrecord_dir,
+                    batch_size=args.batch_size,
+                    num_frames=args.seq_len,
+                    image_size=args.image_size,
+                    split='test',  # girik has no val split, use test
+                    shuffle=False,
+                    prefetch_batches=args.prefetch_batches,
+                )
             elif args.dataset == 'imagenet':
                 val_loader = get_imagenet_loader(
                     data_dir=args.imagenet_dir,
@@ -1391,7 +1579,7 @@ def main():
             if use_multi_gpu:
                 val_metrics = evaluate_multi_gpu(state, val_loader, pmap_eval_step, num_devices)
             else:
-                val_metrics = evaluate(state, val_loader, num_classes, has_batch_stats=has_batch_stats)
+                val_metrics = evaluate(state, val_loader, num_classes, has_batch_stats=has_batch_stats, label_smoothing=args.label_smoothing, bn_train_mode=args.bn_train_mode)
 
             print(f"Epoch {epoch+1} - Val Loss: {val_metrics['val_loss']:.4f}, "
                   f"Val Acc: {val_metrics['val_acc']:.4f}")
@@ -1407,10 +1595,21 @@ def main():
                     'timing/epoch_throughput': throughput,
                 }, step=global_step)
 
-            # Track best model
+            # Track best model + early stopping
             if val_metrics['val_acc'] > best_val_acc:
                 best_val_acc = val_metrics['val_acc']
+                epochs_without_improvement = 0
                 print(f"  New best validation accuracy: {best_val_acc:.4f}")
+            else:
+                epochs_without_improvement += 1
+                if args.early_stopping_patience > 0:
+                    print(f"  No improvement for {epochs_without_improvement}/{args.early_stopping_patience} epochs")
+
+            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+                print(f"  Early stopping: no improvement for {args.early_stopping_patience} epochs")
+                if not args.no_wandb:
+                    wandb.log({'early_stopped_epoch': epoch + 1})
+                break
 
             # Save checkpoint based on best val loss (for pathfinder)
             if args.save_best_only and val_metrics['val_loss'] < best_val_loss:
@@ -1428,7 +1627,8 @@ def main():
                     save_state = save_state.replace(epoch=jnp.array(epoch))
                 else:
                     save_state = state
-                checkpointer.save(best_checkpoint_path, save_state)
+                save_kwargs = {'training_args': vars(args)} if isinstance(checkpointer, SimpleCheckpointer) else {}
+                checkpointer.save(best_checkpoint_path, save_state, **save_kwargs)
                 print(f"  New best val_loss: {best_val_loss:.4f} - Saved to {best_checkpoint_path}")
 
         # Save checkpoint periodically (if not using best-only mode)
@@ -1440,7 +1640,8 @@ def main():
                 save_state = save_state.replace(epoch=jnp.array(epoch))
             else:
                 save_state = state
-            checkpointer.save(ckpt_path, save_state)
+            save_kwargs = {'training_args': vars(args)} if isinstance(checkpointer, SimpleCheckpointer) else {}
+            checkpointer.save(ckpt_path, save_state, **save_kwargs)
             print(f"  Saved checkpoint to {ckpt_path}")
 
     # Wait for any pending checkpoint operations to complete
