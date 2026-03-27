@@ -614,7 +614,7 @@ def main():
 
     # CSSM configuration
     parser.add_argument('--cssm', type=str,
-                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm'],
+                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm', 'no_fft'],
                         default='hgru_bi',
                         help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan), add_delta (delta-enhanced 3-state), deltanet (spectral DeltaNet), deltanet_d2 (matrix DeltaNet d_k=2), deltanet_d3 (matrix DeltaNet d_k=3), gdn (gated DeltaNet d_k=2), gdn_d2 (gated DeltaNet d_k=2), gdn_d3 (gated DeltaNet d_k=3)')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
@@ -688,7 +688,9 @@ def main():
                         help='[spatial_attn] Stochastic depth drop rate')
     # GatedDeltaNetCSSM (gdn) config
     parser.add_argument('--short_conv_size', type=int, default=4,
-                        help='[gdn] Temporal short conv kernel size (0=disabled)')
+                        help='[gdn/gated] Temporal short conv kernel size (0=disabled)')
+    parser.add_argument('--short_conv_spatial_size', type=int, default=3,
+                        help='[gated] Spatial depthwise conv kernel size (0=disabled, 1=pointwise/no spatial mixing)')
     parser.add_argument('--output_norm', type=str, default='rms',
                         choices=['rms', 'layer', 'none'],
                         help='[gdn] Output norm before gating')
@@ -1078,6 +1080,7 @@ def main():
             drop_path_rate=args.drop_path_rate,
             # GatedDeltaNetCSSM (gdn) config
             short_conv_size=args.short_conv_size,
+            short_conv_spatial_size=args.short_conv_spatial_size,
             output_norm=args.output_norm,
             use_input_gates=not args.no_input_gates,
             output_gate_act=args.output_gate_act,
@@ -1405,12 +1408,20 @@ def main():
                     continue
 
                 # Variable sequence length training: randomly sample seq_len per batch
+                # Zero-pads early frames instead of slicing, so tensor shape stays fixed
+                # (avoids JIT recompilation for each length). The model always sees
+                # (B, seq_len, H, W, C) but the first (seq_len - T) frames are zeros,
+                # so the recurrence only processes T real frames of signal.
                 if args.variable_seq_len:
                     rng, seq_rng = jax.random.split(rng)
-                    # Sample seq_len uniformly from [seq_len_min, seq_len]
+                    # Sample effective length T from [seq_len_min, seq_len]
                     current_seq_len = int(jax.random.randint(seq_rng, (), args.seq_len_min, args.seq_len + 1))
-                    # Slice videos to the sampled length (videos shape: B, T, H, W, C)
-                    videos = videos[:, :current_seq_len]
+                    T_max = videos.shape[1]
+                    if current_seq_len < T_max:
+                        # Zero out early frames: keep last current_seq_len frames
+                        mask = np.zeros((1, T_max, 1, 1, 1), dtype=np.float32)
+                        mask[:, T_max - current_seq_len:] = 1.0
+                        videos = videos * mask
 
                 # Time the training step
                 if not first_step_done:

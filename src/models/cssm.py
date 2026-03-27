@@ -5124,26 +5124,25 @@ class GDNSeqCSSM(nn.Module):
 
 
 class ConvSSMCSSM(nn.Module):
-    """ConvSSM — Real-valued spatial conv in temporal scan (NVlabs arXiv:2310.19694).
+    """ConvSSM — Real-valued depthwise conv + temporal scan (NVlabs arXiv:2310.19694).
 
     Keeps 5D (B,T,H,W,C) structure — HAS spatial inductive bias.
-    Uses FFT-based depthwise spatial conv + scalar temporal recurrence.
+    All operations in real spatial domain — NO Fourier transform.
 
-    Architecture (matches NVlabs ConvSSM paper — simple, no Mamba gating):
-        1. Learned depthwise spatial kernel → FFT → stable spectral magnitude
-        2. Input projection: B_bar = Dense(C) per-timestep
-        3. State update: S_t = A_hat * S_{t-1} + B_bar * x_hat  (per freq bin)
-        4. Scalar scan via direct_scalar_scan_op
-        5. Output: C_bar = Dense(C), y_hat = S * C_bar
-        6. iFFT → Dense(C) output projection
+    Architecture:
+        1. Depthwise spatial conv (kernel_size × kernel_size) for spatial mixing
+        2. Learned per-channel scalar decay A ∈ (0, 1) via sigmoid
+        3. Input gate: B_bar = Dense(C) per-timestep
+        4. State update: S_t = A * S_{t-1} + B_bar * conv(x_t)  (per spatial position)
+        5. Output gate: C_bar = Dense(C), y = S * C_bar
+        6. Output projection Dense(C)
 
-    No in_proj expansion, no z-branch, no SiLU gating (matches paper).
+    No FFT, no in_proj expansion, no z-branch, no SiLU gating.
 
     Returns delta for SimpleCSSM's external residual.
     """
     channels: int
     kernel_size: int = 3
-    spectral_rho: float = 0.999
     # Unused CSSM kwargs (accepted for interface compat)
     block_size: int = 1
     rope_mode: str = 'none'
@@ -5152,66 +5151,155 @@ class ConvSSMCSSM(nn.Module):
     def __call__(self, x, injected_qkv_spatial=None):
         B, T, H, W, C = x.shape
         x_in = x
-        W_freq = W // 2 + 1
 
-        # === 1. Spatial kernel → FFT → stable spectral magnitude ===
-        k_spatial = self.param('kernel', nn.initializers.xavier_normal(),
-                               (C, self.kernel_size, self.kernel_size))
-
-        # Pad or crop kernel to input spatial size
-        ks = self.kernel_size
-        if ks > H or ks > W:
-            start_h = (ks - H) // 2
-            start_w = (ks - W) // 2
-            k_padded = k_spatial[:, start_h:start_h+H, start_w:start_w+W]
-        else:
-            pad_h = (H - ks) // 2
-            pad_w = (W - ks) // 2
-            pad_h_after = H - ks - pad_h
-            pad_w_after = W - ks - pad_w
-            k_padded = jnp.pad(k_spatial,
-                               ((0, 0), (pad_h, max(0, pad_h_after)),
-                                (pad_w, max(0, pad_w_after))),
-                               mode='constant')
-
-        A_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
-        A_hat = _stable_spectral_magnitude(A_hat, rho=self.spectral_rho)
-        A_hat = A_hat.astype(jnp.complex64)
-
-        # === 2. FFT of input ===
-        x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        X_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-
-        # === 3. Input projection B_bar (per-timestep, spatial-pooled context) ===
+        # === 1. Depthwise spatial conv for spatial mixing ===
         x_flat = x.reshape(B * T, H, W, C)
-        B_bar = nn.Dense(C, name='B_proj')(x_flat)  # (B*T, H, W, C)
-        B_bar = B_bar.reshape(B, T, H, W, C)
-        # FFT of B_bar for spectral-domain multiplication
-        B_hat = jnp.fft.rfft2(B_bar.transpose(0, 1, 4, 2, 3), axes=(3, 4))  # (B, T, C, H, W_freq)
+        x_conv = nn.Conv(C, kernel_size=(self.kernel_size, self.kernel_size),
+                         feature_group_count=C, padding='SAME',
+                         name='spatial_conv')(x_flat)  # (B*T, H, W, C)
+        x_conv = x_conv.reshape(B, T, H, W, C)
 
-        # Modulated input: B_bar * x in spectral domain
-        U_hat = B_hat * X_hat  # (B, T, C, H, W_freq)
+        # === 2. Learned per-channel decay A ∈ (0, 1) ===
+        A_logit = self.param('A_logit', nn.initializers.constant(2.0), (C,))
+        A = nn.sigmoid(A_logit)  # (C,) in (0, 1)
+        # Broadcast: (C,) → (B, T, H, W, C)
+        A_broadcast = jnp.broadcast_to(A[None, None, None, None, :], (B, T, H, W, C))
 
-        # === 4. Scalar scan: S_t = A_hat * S_{t-1} + U_hat_t ===
-        # Broadcast A_hat: (C, H, W_freq) → (B, T, C, H, W_freq)
-        A_broadcast = jnp.broadcast_to(A_hat[None, None], (B, T, C, H, W_freq))
+        # === 3. Input gate B_bar ===
+        B_bar = nn.Dense(C, name='B_proj')(x_flat).reshape(B, T, H, W, C)
 
-        # Direct scalar scan
-        _, S_hat = jax.lax.associative_scan(
-            direct_scalar_scan_op, (A_broadcast, U_hat.astype(jnp.complex64)), axis=1
+        # Modulated input
+        U = B_bar * x_conv  # (B, T, H, W, C)
+
+        # === 4. Scalar scan: S_t = A * S_{t-1} + U_t per spatial position ===
+        # Reshape for scan: (B, T, H*W*C)
+        A_scan = A_broadcast.reshape(B, T, H * W * C)
+        U_scan = U.reshape(B, T, H * W * C)
+
+        _, S_scan = jax.lax.associative_scan(
+            direct_scalar_scan_op,
+            (A_scan.astype(jnp.complex64), U_scan.astype(jnp.complex64)),
+            axis=1
         )
+        S = S_scan.real.reshape(B, T, H, W, C)
 
-        # === 5. Output projection C_bar ===
-        C_bar = nn.Dense(C, name='C_proj')(x_flat)  # (B*T, H, W, C)
-        C_bar = C_bar.reshape(B, T, H, W, C)
-        C_hat = jnp.fft.rfft2(C_bar.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        # === 5. Output gate C_bar ===
+        C_bar = nn.Dense(C, name='C_proj')(x_flat).reshape(B, T, H, W, C)
+        output = S * C_bar
 
-        Y_hat = S_hat * C_hat  # (B, T, C, H, W_freq)
+        # === 6. Output projection ===
+        output = nn.Dense(C, name='out_proj')(output.reshape(B * T, H, W, C))
+        output = output.reshape(B, T, H, W, C)
 
-        # === 6. iFFT → output projection ===
-        Y_spatial = jnp.fft.irfft2(Y_hat, s=(H, W), axes=(3, 4))  # (B, T, C, H, W)
-        output = Y_spatial.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        return output - x_in
 
+
+class NoFFTCSSM(nn.Module):
+    """Mamba-style SSM with NO FFT — operates entirely in pixel domain.
+
+    Same architecture as GatedCSSM but without any spectral transform:
+        1. in_proj(2C) → (x_main, z)
+        2. Optional short temporal conv → SiLU
+        3. Per-channel scalar decay A ∈ (0,1) via sigmoid
+        4. Input-dependent gates B, C, Delta from spatially-pooled context
+           projected to (H, W) spatial positions (NOT frequency bins)
+        5. Scalar scan: S_t = A^delta * S_{t-1} + delta * B * x_main
+        6. Output: C * S, then RMSNorm → SiLU(z) gating → out_proj
+
+    No FFT, no spatial convolution, no frequency-selective gating.
+    Tests whether the FFT provides spatial structure beyond what
+    per-pixel operations can achieve.
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    kernel_size: int = 1  # unused, for API compat
+    spectral_rho: float = 0.999  # unused
+    gate_activation: str = 'softplus'
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    position_independent_gates: bool = False
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+
+    def _compute_gate(self, x):
+        if self.gate_activation == 'softplus':
+            return nn.softplus(x)
+        elif self.gate_activation == 'sigmoid':
+            return nn.sigmoid(x) * 2.0
+        else:
+            return nn.softplus(x)
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        # === 0. Input expansion: x → (x_main, z) ===
+        x_flat = x.reshape(B * T, H, W, C)
+        xz = nn.Dense(2 * C, name='in_proj')(x_flat)
+        xz = xz.reshape(B, T, H, W, 2 * C)
+        x_main = xz[..., :C]
+        z = xz[..., C:]
+
+        # === 1. Optional short convs → SiLU ===
+        if self.short_conv_spatial_size > 0:
+            x_sp = x_main.reshape(B * T, H, W, C)
+            x_sp = nn.Conv(C, kernel_size=(self.short_conv_spatial_size, self.short_conv_spatial_size),
+                           feature_group_count=C, padding='SAME',
+                           name='short_conv_spatial')(x_sp)
+            x_main = x_sp.reshape(B, T, H, W, C)
+
+        if self.short_conv_size > 0:
+            x_1d = x_main.transpose(0, 2, 3, 1, 4).reshape(B * H * W, T, C)
+            x_1d = jnp.pad(x_1d, ((0, 0), (self.short_conv_size - 1, 0), (0, 0)))
+            x_1d = nn.Conv(C, kernel_size=(self.short_conv_size,),
+                           feature_group_count=C, padding='VALID',
+                           name='short_conv_temporal')(x_1d)
+            x_main = x_1d.reshape(B, H, W, T, C).transpose(0, 3, 1, 2, 4)
+
+        x_main = jax.nn.silu(x_main)
+
+        # === 2. Per-channel scalar decay ===
+        A_logit = self.param('A_logit', nn.initializers.constant(2.0), (C,))
+        A = nn.sigmoid(A_logit)  # (C,) in (0, 1)
+
+        # === 3. Input-dependent gates from spatially-pooled context ===
+        # Project to H*W spatial positions — NOT frequency bins
+        ctx = x_main.mean(axis=(2, 3))  # (B, T, C)
+
+        delta_raw = nn.Dense(H * W, name='delta_proj')(ctx)
+        delta = self._compute_gate(delta_raw).reshape(B, T, H, W, 1)
+
+        B_proj = nn.Dense(H * W, name='B_proj')(ctx).reshape(B, T, H, W, 1)
+        C_proj = nn.Dense(H * W, name='C_proj')(ctx).reshape(B, T, H, W, 1)
+
+        # === 4. Discretize ===
+        A_bar = jnp.broadcast_to(A[None, None, None, None, :], (B, T, H, W, C))
+        A_bar = A_bar ** delta  # per-pixel decay
+
+        U = B_proj * x_main * delta  # (B, T, H, W, C)
+
+        # === 5. Scalar scan per spatial position ===
+        A_scan = A_bar.reshape(B, T, H * W * C)
+        U_scan = U.reshape(B, T, H * W * C)
+
+        _, S_scan = jax.lax.associative_scan(
+            direct_scalar_scan_op,
+            (A_scan.astype(jnp.complex64), U_scan.astype(jnp.complex64)),
+            axis=1
+        )
+        S = S_scan.real.reshape(B, T, H, W, C)
+
+        # === 6. Output: C gate → RMSNorm → SiLU(z) → project ===
+        ssm_out = S * C_proj
+
+        rms_scale = self.param('rms_scale', nn.initializers.ones, (C,))
+        ms = jnp.mean(ssm_out ** 2, axis=-1, keepdims=True)
+        ssm_out = ssm_out * jax.lax.rsqrt(ms + 1e-6) * rms_scale
+
+        output = ssm_out * jax.nn.silu(z)
         output = nn.Dense(C, name='out_proj')(output.reshape(B * T, H, W, C))
         output = output.reshape(B, T, H, W, C)
 

@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, NoFFTCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
 
 
 # Registry of CSSM variants
@@ -46,6 +46,7 @@ CSSM_REGISTRY = {
     'mamba2_seq': Mamba2SeqCSSM,              # Mamba-2 on flattened 1D tokens (no spatial)
     'gdn_seq': GDNSeqCSSM,                   # Gated DeltaNet on flattened 1D tokens (no spatial)
     'conv_ssm': ConvSSMCSSM,                  # ConvSSM: spatial conv + temporal scan (NVlabs)
+    'no_fft': NoFFTCSSM,                      # No-FFT Mamba: pixel-domain scalar scan, no spectral transform
 }
 
 
@@ -124,6 +125,7 @@ class SimpleCSSM(nn.Module):
     drop_path_rate: float = 0.0      # Stochastic depth rate
     # GatedDeltaNetCSSM (gdn) config
     short_conv_size: int = 4         # Temporal short conv kernel size (0=disabled)
+    short_conv_spatial_size: int = 3 # Spatial depthwise conv kernel size in GatedCSSM (0=disabled, 1=pointwise)
     output_norm: str = 'rms'         # Output norm before gating ('rms', 'layer', 'none')
     use_input_gates: bool = True     # B_k, B_v spatial input gates
     output_gate_act: str = 'silu'    # Output gate activation ('silu' or 'sigmoid')
@@ -314,6 +316,14 @@ class SimpleCSSM(nn.Module):
                 rope_mode=rope_mode,  # Spatiotemporal RoPE inside CSSM
                 name=f'cssm_{i}'
             )
+            # GatedCSSM (gated/Spectral Mamba) config
+            if self.cssm_type == 'gated':
+                cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
+                cssm_kwargs['short_conv_size'] = self.short_conv_size
+            # NoFFTCSSM config
+            if self.cssm_type == 'no_fft':
+                cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
+                cssm_kwargs['short_conv_size'] = self.short_conv_size
             # position_independent_gates applies to transformer variants
             if self.cssm_type in ['transformer', 'mult_transformer', 'g_transformer', 'mg_transformer'] and self.position_independent_gates:
                 cssm_kwargs['position_independent_gates'] = True
