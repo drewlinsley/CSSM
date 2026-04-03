@@ -11,7 +11,7 @@ import numpy as np
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import StandardCSSM, GatedOpponentCSSM
+from .cssm import GatedCSSM
 from .tiny_vit import DropPath, PatchEmbed, Mlp
 
 
@@ -42,7 +42,7 @@ class CSSMTinyViTBlock(nn.Module):
         """
         B, H, W, C = x.shape
 
-        CSSM = GatedOpponentCSSM if self.cssm_type == 'opponent' else StandardCSSM
+        CSSM = GatedCSSM
 
         # CSSM path
         residual = x

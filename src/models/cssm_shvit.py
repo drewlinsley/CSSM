@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn
 from typing import Sequence, Optional
 
-from .cssm import StandardCSSM, GatedCSSM, GatedOpponentCSSM
+from .cssm import GatedCSSM, GatedDeltaNetCSSM
 from .shvit import DropPath, ConvBN, PatchEmbed, Downsample, Mlp, ConvBlock
 
 
@@ -20,17 +20,14 @@ class CSSMSHViTBlock(nn.Module):
     """
     SHViT block with CSSM replacing single-head attention.
 
-    Matches SHViT architecture with optional VideoRoPE-style position encoding.
-
-    Supports three CSSM types:
-    - 'standard': Fixed kernel, no input-dependent gating
-    - 'gated': Mamba-style input-dependent gating (recommended)
-    - 'opponent': Coupled oscillator with excitation/inhibition
+    Supports two CSSM types:
+    - 'gated': GatedCSSM (Spectral Mamba) — Mamba-style scalar recurrence with FFT spatial mixing
+    - 'gdn': GatedDeltaNetCSSM — Matrix delta rule with QKV, RMSNorm output, SiLU gating
     """
     dim: int
     mlp_ratio: float = 4.0
     drop_path: float = 0.0
-    cssm_type: str = 'gated'  # 'standard', 'gated', or 'opponent'
+    cssm_type: str = 'gated'  # 'gated' (Spectral Mamba) or 'gdn' (GatedDeltaNet)
     dense_mixing: bool = False
     block_size: int = 32  # Block size for LMME channel mixing (only with gated + dense_mixing)
     mixing_rank: int = 0  # If > 0, use low-rank mixing (recommended: 4-16)
@@ -41,6 +38,14 @@ class CSSMSHViTBlock(nn.Module):
     rope_mode: str = 'none'  # 'spatiotemporal', 'temporal', or 'none'
     use_dwconv: bool = True  # DWConv in MLP (matches SHViT)
     output_act: str = 'none'  # Output activation after CSSM: 'gelu', 'silu', or 'none'
+    short_conv_size: int = 4       # Temporal causal conv kernel size (0=disabled)
+    short_conv_spatial_size: int = 3  # Spatial depthwise conv kernel size (0=disabled, set 0 for 1x1)
+    # GDN-specific
+    delta_key_dim: int = 2         # Key dimension for GDN (2 or 3)
+    output_norm: str = 'rms'       # Output norm for GDN ('rms', 'layer', 'none')
+    gate_type: str = 'factored'    # Gate parameterization for GDN
+    # Block norm
+    block_norm: str = 'global_layer'  # 'layer' (per-frame C), 'global_layer' (T,H,W,C), 'temporal_layer' (T,C)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -54,97 +59,94 @@ class CSSMSHViTBlock(nn.Module):
         Returns:
             Output tensor with same dimensionality as input
         """
-        # Handle both 4D (image) and 5D (video) input
-        is_video = x.ndim == 5
-
-        if is_video:
-            B, T, H, W, C = x.shape
-        else:
+        # Always work in 5D — repeat image if needed
+        is_image = x.ndim == 4
+        if is_image:
             B, H, W, C = x.shape
             T = self.num_timesteps
-
-        # Select CSSM variant
-        if self.cssm_type == 'opponent':
-            CSSM = GatedOpponentCSSM
-        elif self.cssm_type == 'gated':
-            CSSM = GatedCSSM
+            x = jnp.repeat(x[:, jnp.newaxis, :, :, :], T, axis=1)  # (B, T, H, W, C)
         else:
-            CSSM = StandardCSSM
-
-        # CSSM path (replaces attention)
-        if is_video:
-            # Video input: process each frame through norm, then CSSM on full video
-            residual = x  # (B, T, H, W, C)
-            # Apply norm per-frame
-            x_flat = x.reshape(B * T, H, W, C)
-            x_flat = nn.LayerNorm(name='norm1')(x_flat)
-            x_video = x_flat.reshape(B, T, H, W, C)
-        else:
-            # Image input: repeat to create temporal dimension
-            residual = x  # (B, H, W, C)
-            x = nn.LayerNorm(name='norm1')(x)
-            x_video = jnp.repeat(x[:, jnp.newaxis, :, :, :], T, axis=1)
-
-        # Apply CSSM (with optional RoPE inside)
-        # Build kwargs - block_size/mixing_rank only for GatedCSSM
-        cssm_kwargs = dict(
-            channels=self.dim,
-            dense_mixing=self.dense_mixing,
-            gate_activation=self.gate_activation,
-            kernel_size=self.kernel_size,
-            spectral_rho=self.spectral_rho,
-            rope_mode=self.rope_mode,
-        )
-        # Only GatedCSSM supports block_size and mixing_rank
-        if self.cssm_type == 'gated':
-            cssm_kwargs['block_size'] = self.block_size
-            cssm_kwargs['mixing_rank'] = self.mixing_rank
-
-        x_video = CSSM(**cssm_kwargs, name='cssm')(x_video)
-
-        # Optional output activation after CSSM (adds nonlinearity like attention's softmax)
-        if self.output_act == 'gelu':
-            x_video = jax.nn.gelu(x_video)
-        elif self.output_act == 'silu':
-            x_video = jax.nn.silu(x_video)
-
-        if is_video:
-            # Video output: keep full temporal dimension
-            x = x_video  # (B, T, H, W, C)
-            x = DropPath(self.drop_path)(x, deterministic)
-            x = residual + x
-        else:
-            # Image output: take last timestep
-            x = x_video[:, -1]  # (B, H, W, C)
-            x = DropPath(self.drop_path)(x, deterministic)
-            x = residual + x
-
-        # MLP path
-        residual = x
-        if is_video:
-            # Video: apply norm and MLP per-frame
             B, T, H, W, C = x.shape
-            x_flat = x.reshape(B * T, H, W, C)
-            x_flat = nn.LayerNorm(name='norm2')(x_flat)
-            x_flat = Mlp(
-                hidden_dim=int(self.dim * self.mlp_ratio),
-                out_dim=self.dim,
-                use_dwconv=self.use_dwconv,
-                name='mlp'
-            )(x_flat, deterministic)
-            x = x_flat.reshape(B, T, H, W, C)
-        else:
-            x = nn.LayerNorm(name='norm2')(x)
-            x = Mlp(
-                hidden_dim=int(self.dim * self.mlp_ratio),
-                out_dim=self.dim,
-                use_dwconv=self.use_dwconv,
-                name='mlp'
-            )(x, deterministic)
-        x = DropPath(self.drop_path)(x, deterministic)
-        x = residual + x
 
-        return x
+        residual = x  # (B, T, H, W, C)
+
+        # --- Pre-norm (respects block_norm for all inputs) ---
+        if self.block_norm == 'global_layer':
+            x = nn.LayerNorm(reduction_axes=(1, 2, 3, 4), feature_axes=-1, name='norm1')(x)
+        elif self.block_norm == 'temporal_layer':
+            x = nn.LayerNorm(reduction_axes=(1, 4), feature_axes=-1, name='norm1')(x)
+        else:  # 'layer' — per-frame, C only
+            x = nn.LayerNorm(name='norm1')(x.reshape(B * T, H, W, C)).reshape(B, T, H, W, C)
+
+        # --- CSSM ---
+        if self.cssm_type == 'gdn':
+            CSSM = GatedDeltaNetCSSM
+            cssm_kwargs = dict(
+                channels=self.dim,
+                delta_key_dim=self.delta_key_dim,
+                kernel_size=self.kernel_size,
+                spectral_rho=self.spectral_rho,
+                rope_mode=self.rope_mode,
+                gate_type=self.gate_type,
+                short_conv_size=self.short_conv_size,
+                output_norm=self.output_norm,
+            )
+        else:  # 'gated'
+            CSSM = GatedCSSM
+            cssm_kwargs = dict(
+                channels=self.dim,
+                dense_mixing=self.dense_mixing,
+                gate_activation=self.gate_activation,
+                kernel_size=self.kernel_size,
+                spectral_rho=self.spectral_rho,
+                rope_mode=self.rope_mode,
+                short_conv_size=self.short_conv_size,
+                short_conv_spatial_size=self.short_conv_spatial_size,
+                block_size=self.block_size,
+                mixing_rank=self.mixing_rank,
+                gate_type=self.gate_type,
+            )
+
+        x = CSSM(**cssm_kwargs, name='cssm')(x)  # (B, T, H, W, C)
+
+        # --- Output positional encoding (matches SHViT's DWConv pos_conv) ---
+        x_last = x[:, -1]  # (B, H, W, C) — take last timestep for pos_conv + output
+        pos = nn.Conv(
+            self.dim,
+            kernel_size=(3, 3),
+            padding='SAME',
+            feature_group_count=self.dim,  # depthwise
+            name='pos_conv',
+        )(x_last)
+        x_out = x_last + pos  # (B, H, W, C)
+
+        # Optional output activation
+        if self.output_act == 'gelu':
+            x_out = jax.nn.gelu(x_out)
+        elif self.output_act == 'silu':
+            x_out = jax.nn.silu(x_out)
+
+        # --- Residual (collapse temporal dim to match) ---
+        if is_image:
+            res_4d = residual[:, -1]  # (B, H, W, C)
+        else:
+            res_4d = residual[:, -1]
+        x_out = DropPath(self.drop_path)(x_out, deterministic)
+        x_out = res_4d + x_out  # (B, H, W, C)
+
+        # --- MLP path (always 4D from here) ---
+        residual = x_out
+        x_out = nn.LayerNorm(name='norm2')(x_out)
+        x_out = Mlp(
+            hidden_dim=int(self.dim * self.mlp_ratio),
+            out_dim=self.dim,
+            use_dwconv=self.use_dwconv,
+            name='mlp'
+        )(x_out, deterministic)
+        x_out = DropPath(self.drop_path)(x_out, deterministic)
+        x_out = residual + x_out
+
+        return x_out  # (B, H, W, C)
 
 
 class CSSMSHViT(nn.Module):
@@ -176,6 +178,14 @@ class CSSMSHViT(nn.Module):
     rope_mode: str = 'none'  # 'spatiotemporal', 'temporal', or 'none'
     use_dwconv: bool = True  # DWConv in MLP (matches SHViT, adds params)
     output_act: str = 'none'  # Output activation after CSSM: 'gelu', 'silu', or 'none'
+    short_conv_size: int = 4       # Temporal causal conv kernel size (0=disabled)
+    short_conv_spatial_size: int = 3  # Spatial depthwise conv kernel size (0=disabled)
+    # GDN-specific
+    delta_key_dim: int = 2
+    output_norm: str = 'rms'
+    gate_type: str = 'factored'
+    # Block norm
+    block_norm: str = 'global_layer'
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
@@ -222,6 +232,12 @@ class CSSMSHViT(nn.Module):
                         rope_mode=self.rope_mode,
                         use_dwconv=self.use_dwconv,
                         output_act=self.output_act,
+                        short_conv_size=self.short_conv_size,
+                        short_conv_spatial_size=self.short_conv_spatial_size,
+                        delta_key_dim=self.delta_key_dim,
+                        output_norm=self.output_norm,
+                        gate_type=self.gate_type,
+                        block_norm=self.block_norm,
                         name=f'stage{stage_idx}_block{block_idx}'
                     )(x, deterministic)
                 else:
@@ -236,8 +252,8 @@ class CSSMSHViT(nn.Module):
         # Final norm
         x = nn.LayerNorm(name='norm')(x)
 
-        # Global max pooling
-        x = jnp.max(x, axis=(1, 2))  # (B, C)
+        # Global average pooling (matches SHViT baseline)
+        x = jnp.mean(x, axis=(1, 2))  # (B, C)
 
         # Classification head
         if not deterministic and self.drop_rate > 0:

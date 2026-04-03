@@ -14,7 +14,7 @@ import numpy as np
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import StandardCSSM, GatedOpponentCSSM
+from .cssm import GatedCSSM
 from .deit3 import DropPath, PatchEmbed, Mlp
 
 
@@ -55,7 +55,7 @@ class CSSMDeiT3Block(nn.Module):
         B, H, W, C = x.shape
 
         # Select CSSM class
-        CSSM = GatedOpponentCSSM if self.cssm_type == 'opponent' else StandardCSSM
+        CSSM = GatedCSSM
 
         # --- CSSM Path ---
         residual = x

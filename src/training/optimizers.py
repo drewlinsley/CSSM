@@ -20,6 +20,9 @@ def create_optimizer(
     total_steps: int = 1000,
     warmup_steps: int = 500,
     grad_clip: float = 1.0,
+    grad_clip_mode: str = 'norm',
+    agc_clip_factor: float = 0.02,
+    min_lr: float = None,
     b1: float = 0.9,
     b2: float = 0.999,
     eps: float = 1e-6,
@@ -48,19 +51,26 @@ def create_optimizer(
         create_optimizer('adamw', lr=1e-3, weight_decay=0.05, ...)
     """
     # Learning rate schedule: warmup + cosine decay
+    end_value = min_lr if min_lr is not None else learning_rate * 0.01
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=learning_rate,
         warmup_steps=warmup_steps,
         decay_steps=total_steps - warmup_steps,
-        end_value=learning_rate * 0.01,
+        end_value=end_value,
     )
+
+    # Gradient clipping
+    if grad_clip_mode == 'agc':
+        clip_fn = optax.adaptive_grad_clip(clipping=agc_clip_factor)
+    else:
+        clip_fn = optax.clip_by_global_norm(grad_clip)
 
     if optimizer_name == 'adamw':
         # AdamW: Adam with decoupled weight decay
         # Good default for most vision transformers
         return optax.chain(
-            optax.clip_by_global_norm(grad_clip),
+            clip_fn,
             optax.adamw(
                 learning_rate=schedule,
                 weight_decay=weight_decay,
@@ -75,7 +85,7 @@ def create_optimizer(
         # Used by DeiT III for large-batch training with high LR
         # Reference: https://arxiv.org/abs/1904.00962
         return optax.chain(
-            optax.clip_by_global_norm(grad_clip),
+            clip_fn,
             optax.lamb(
                 learning_rate=schedule,
                 weight_decay=weight_decay,

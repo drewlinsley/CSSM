@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, NoFFTCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, NoFFTCSSM, NoGateCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
 
 
 # Registry of CSSM variants
@@ -47,6 +47,7 @@ CSSM_REGISTRY = {
     'gdn_seq': GDNSeqCSSM,                   # Gated DeltaNet on flattened 1D tokens (no spatial)
     'conv_ssm': ConvSSMCSSM,                  # ConvSSM: spatial conv + temporal scan (NVlabs)
     'no_fft': NoFFTCSSM,                      # No-FFT Mamba: pixel-domain scalar scan, no spectral transform
+    'no_gate': NoGateCSSM,                    # No-gate spectral CSSM: FFT + kernel only, no B/C/Delta gates
 }
 
 
@@ -320,8 +321,14 @@ class SimpleCSSM(nn.Module):
             if self.cssm_type == 'gated':
                 cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
                 cssm_kwargs['short_conv_size'] = self.short_conv_size
+                cssm_kwargs['gate_type'] = self.gate_type
             # NoFFTCSSM config
             if self.cssm_type == 'no_fft':
+                cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
+                cssm_kwargs['short_conv_size'] = self.short_conv_size
+                cssm_kwargs['gate_type'] = self.gate_type
+            # NoGateCSSM config
+            if self.cssm_type == 'no_gate':
                 cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
                 cssm_kwargs['short_conv_size'] = self.short_conv_size
             # position_independent_gates applies to transformer variants

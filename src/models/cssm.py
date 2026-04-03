@@ -426,6 +426,7 @@ class GatedCSSM(nn.Module):
     position_independent_gates: bool = False  # If True, compute gates from raw input (before pos encoding)
     short_conv_size: int = 4       # Temporal causal conv kernel size (0=disabled)
     short_conv_spatial_size: int = 3  # Spatial depthwise conv kernel size (0=disabled)
+    gate_type: str = 'dense'  # 'dense' (Dense(C→H*W_freq)) or 'factored' (Dense(C→H) × Dense(C→W_freq))
 
     def _compute_gate(self, x: jnp.ndarray) -> jnp.ndarray:
         """Compute input-dependent gate with specified activation."""
@@ -533,17 +534,25 @@ class GatedCSSM(nn.Module):
         # --- 5. Input-Dependent Gates (from post-conv features, like Mamba) ---
         ctx = x_main.mean(axis=(2, 3))  # (B, T, C)
 
+        def _make_gate(ctx, name, H, W_freq):
+            """Create per-frequency gate, dense or factored."""
+            if self.gate_type == 'factored':
+                g_h = nn.Dense(H, name=f'{name}_h')(ctx)      # (B, T, H)
+                g_w = nn.Dense(W_freq, name=f'{name}_w')(ctx)  # (B, T, W_freq)
+                return (g_h[..., :, None] * g_w[..., None, :]).reshape(B, T, 1, H, W_freq)
+            else:  # 'dense'
+                return nn.Dense(H * W_freq, name=name)(ctx).reshape(B, T, 1, H, W_freq)
+
         # Δ — per-frequency decay gate (softplus, same as Mamba)
-        delta_raw = nn.Dense(H * W_freq, name='delta_proj')(ctx)
-        delta_raw = delta_raw.reshape(B, T, H * W_freq)
+        delta_raw = _make_gate(ctx, 'delta_proj', H, W_freq).reshape(B, T, H * W_freq)
         delta_freq = self._compute_gate(delta_raw)
         delta_freq = delta_freq.reshape(B, T, 1, H, W_freq)
 
         # B — unconstrained linear projection (like Mamba)
-        B_proj = nn.Dense(H * W_freq, name='B_proj')(ctx).reshape(B, T, 1, H, W_freq)
+        B_proj = _make_gate(ctx, 'B_proj', H, W_freq)
 
         # C — unconstrained linear projection (like Mamba)
-        C_proj = nn.Dense(H * W_freq, name='C_proj')(ctx).reshape(B, T, 1, H, W_freq)
+        C_proj = _make_gate(ctx, 'C_proj', H, W_freq)
 
         # --- 6. Convert to GOOM (log-space) ---
         K_log = to_goom(K_hat)
@@ -5216,6 +5225,7 @@ class NoFFTCSSM(nn.Module):
     kernel_size: int = 1  # unused, for API compat
     spectral_rho: float = 0.999  # unused
     gate_activation: str = 'softplus'
+    gate_type: str = 'dense'  # 'dense' (full H*W) or 'factored' (separable H + W)
     rope_mode: str = 'none'
     rope_base: float = 10000.0
     position_independent_gates: bool = False
@@ -5266,14 +5276,22 @@ class NoFFTCSSM(nn.Module):
         A = nn.sigmoid(A_logit)  # (C,) in (0, 1)
 
         # === 3. Input-dependent gates from spatially-pooled context ===
-        # Project to H*W spatial positions — NOT frequency bins
         ctx = x_main.mean(axis=(2, 3))  # (B, T, C)
 
-        delta_raw = nn.Dense(H * W, name='delta_proj')(ctx)
-        delta = self._compute_gate(delta_raw).reshape(B, T, H, W, 1)
+        def _spatial_gate(ctx, name):
+            """Project ctx to (B, T, H, W, 1) gate. Dense or factored."""
+            if self.gate_type == 'factored':
+                row = nn.Dense(H, name=f'{name}_h')(ctx)  # (B, T, H)
+                col = nn.Dense(W, name=f'{name}_w')(ctx)  # (B, T, W)
+                return (row[..., :, None] + col[..., None, :]).reshape(B, T, H, W, 1)
+            else:  # dense
+                return nn.Dense(H * W, name=name)(ctx).reshape(B, T, H, W, 1)
 
-        B_proj = nn.Dense(H * W, name='B_proj')(ctx).reshape(B, T, H, W, 1)
-        C_proj = nn.Dense(H * W, name='C_proj')(ctx).reshape(B, T, H, W, 1)
+        delta_raw = _spatial_gate(ctx, 'delta_proj')
+        delta = self._compute_gate(delta_raw)
+
+        B_proj = _spatial_gate(ctx, 'B_proj')
+        C_proj = _spatial_gate(ctx, 'C_proj')
 
         # === 4. Discretize ===
         A_bar = jnp.broadcast_to(A[None, None, None, None, :], (B, T, H, W, C))
@@ -5304,3 +5322,80 @@ class NoFFTCSSM(nn.Module):
         output = output.reshape(B, T, H, W, C)
 
         return output - x_in
+
+
+class NoGateCSSM(nn.Module):
+    """Minimal spectral CSSM — ONLY the spectral kernel recurrence.
+
+    Isolates the pure spectral convolution dynamics:
+        S_hat_t(f) = K_hat(f) * S_hat_{t-1}(f) + X_hat_t(f)
+        y_t = iFFT(S_hat_t)
+
+    No in_proj, no SiLU, no gating, no B/C/Delta.
+    Just: FFT → spectral recurrence → iFFT → out_proj.
+
+    With kernel_size=1:  uniform decay, no spatial mixing → should fail
+    With kernel_size>1:  spectral conv in transition → tests if kernel alone suffices
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    kernel_size: int = 11
+    spectral_rho: float = 0.999
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    short_conv_size: int = 4      # accepted for interface compat, unused
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    position_independent_gates: bool = False
+    gate_type: str = 'dense'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        # === 1. Spectral kernel (learned, fixed) ===
+        k_spatial = self.param('kernel', nn.initializers.normal(0.02),
+                               (C, self.kernel_size, self.kernel_size))
+
+        ks = self.kernel_size
+        if ks > H or ks > W:
+            start_h = (ks - H) // 2
+            start_w = (ks - W) // 2
+            k_padded = k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+        else:
+            pad_h = (H - ks) // 2
+            pad_w = (W - ks) // 2
+            pad_h_after = H - ks - pad_h
+            pad_w_after = W - ks - pad_w
+            k_padded = jnp.pad(k_spatial,
+                               ((0, 0), (pad_h, max(0, pad_h_after)),
+                                (pad_w, max(0, pad_w_after))),
+                               mode='constant')
+
+        K_hat = _stable_spectral_magnitude(
+            jnp.fft.rfft2(k_padded, axes=(1, 2)), rho=self.spectral_rho
+        )  # (C, H, W_freq)
+
+        # === 2. FFT input (raw, no in_proj, no nonlinearity) ===
+        x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
+        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
+
+        K_broadcast = jnp.broadcast_to(
+            K_hat[None, None].astype(jnp.complex64), (B, T, C, H, W_freq)
+        )
+
+        # === 3. Scalar scan: S_hat_t = K * S_hat_{t-1} + U_hat_t ===
+        _, S_hat = jax.lax.associative_scan(
+            direct_scalar_scan_op,
+            (K_broadcast, U_hat.astype(jnp.complex64)),
+            axis=1
+        )
+
+        # === 4. iFFT → out_proj (linear only) ===
+        ssm_out = jnp.fft.irfft2(S_hat, s=(H, W), axes=(3, 4))
+        ssm_out = ssm_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+
+        output = nn.Dense(C, name='out_proj')(ssm_out.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x

@@ -116,7 +116,7 @@ def main():
                         default='/media/data_cifs/projects/prj_video_imagenet/data/pathfinder_tfrecords',
                         help='Output directory for TFRecords')
     parser.add_argument('--difficulty', type=str, default='9',
-                        choices=['9', '14', '20'],
+                        choices=['9', '14', '20', '25'],
                         help='Pathfinder difficulty level')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Target image size')

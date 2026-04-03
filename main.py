@@ -614,7 +614,7 @@ def main():
 
     # CSSM configuration
     parser.add_argument('--cssm', type=str,
-                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm', 'no_fft'],
+                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm', 'no_fft', 'no_gate'],
                         default='hgru_bi',
                         help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan), add_delta (delta-enhanced 3-state), deltanet (spectral DeltaNet), deltanet_d2 (matrix DeltaNet d_k=2), deltanet_d3 (matrix DeltaNet d_k=3), gdn (gated DeltaNet d_k=2), gdn_d2 (gated DeltaNet d_k=2), gdn_d3 (gated DeltaNet d_k=3)')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
@@ -878,7 +878,7 @@ def main():
     parser.add_argument('--pathtracker_dir', type=str,
                         default='/media/data_cifs/projects/prj_video_datasets/pathtracker',
                         help='Path to PathTracker dataset directory')
-    parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20'], default='9',
+    parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20', '25'], default='9',
                         help='[pathfinder] Contour length difficulty (9=easy, 20=hard)')
     parser.add_argument('--cabc_difficulty', type=str, choices=['easy', 'medium', 'hard'], default='easy',
                         help='[cabc] Difficulty level (easy, medium, hard)')

@@ -115,6 +115,9 @@ def create_train_state(
     total_steps: int,
     warmup_steps: int = 500,
     grad_clip: float = 1.0,
+    grad_clip_mode: str = 'norm',
+    agc_clip_factor: float = 0.02,
+    min_lr: float = None,
     image_size: int = 384,
     optimizer_name: str = 'adamw',
 ):
@@ -138,6 +141,9 @@ def create_train_state(
         total_steps=total_steps,
         warmup_steps=warmup_steps,
         grad_clip=grad_clip,
+        grad_clip_mode=grad_clip_mode,
+        agc_clip_factor=agc_clip_factor,
+        min_lr=min_lr,
     )
 
     state = TrainState.create(
@@ -163,8 +169,16 @@ def main():
                         help='Input image size (224 or 384)')
 
     # CSSM options
-    parser.add_argument('--cssm_type', type=str, choices=['standard', 'gated', 'opponent'],
-                        default='gated', help='CSSM type: standard (no gates), gated (Mamba-style), opponent (coupled oscillator)')
+    parser.add_argument('--cssm_type', type=str, choices=['gated', 'gdn'],
+                        default='gated', help='CSSM type: gated (Spectral Mamba), gdn (GatedDeltaNet with RMSNorm)')
+    parser.add_argument('--delta_key_dim', type=int, default=2,
+                        help='Key dimension for GDN CSSM (2 or 3)')
+    parser.add_argument('--output_norm', type=str, default='rms',
+                        choices=['rms', 'layer', 'none'],
+                        help='Output normalization for GDN CSSM')
+    parser.add_argument('--gate_type_cssm', type=str, default='factored',
+                        choices=['factored', 'channel', 'dense', 'scalar'],
+                        help='Gate parameterization for GDN CSSM')
     parser.add_argument('--num_timesteps', type=int, default=8,
                         help='Number of CSSM recurrence timesteps (used for eval if --variable_timesteps set)')
     parser.add_argument('--variable_timesteps', type=str, default=None,
@@ -190,6 +204,15 @@ def main():
     parser.add_argument('--output_act', type=str, default='none',
                         choices=['none', 'gelu', 'silu'],
                         help='Output activation after CSSM (adds nonlinearity)')
+    parser.add_argument('--kernel_size', type=int, default=5,
+                        help='CSSM spectral kernel size (1=no spatial kernel, all spatial mixing via FFT gates)')
+    parser.add_argument('--short_conv_spatial_size', type=int, default=3,
+                        help='Spatial depthwise conv kernel size in CSSM (0=disabled)')
+    parser.add_argument('--short_conv_size', type=int, default=4,
+                        help='Temporal causal conv kernel size in CSSM (0=disabled)')
+    parser.add_argument('--block_norm', type=str, default='global_layer',
+                        choices=['layer', 'global_layer', 'temporal_layer'],
+                        help='Normalization in CSSM blocks: layer (per-frame C), global_layer (T,H,W,C), temporal_layer (T,C)')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=32,
@@ -204,12 +227,23 @@ def main():
                         help='Number of warmup epochs')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping norm')
+    parser.add_argument('--grad_clip_mode', type=str, default='norm',
+                        choices=['norm', 'agc'],
+                        help='Gradient clipping mode: norm (standard) or agc (adaptive gradient clipping)')
+    parser.add_argument('--agc_clip_factor', type=float, default=0.02,
+                        help='AGC clipping factor (only used with --grad_clip_mode agc)')
     parser.add_argument('--drop_path_rate', type=float, default=0.1,
                         help='Stochastic depth rate')
+    parser.add_argument('--min_lr', type=float, default=1e-5,
+                        help='Minimum learning rate for cosine schedule')
+    parser.add_argument('--repeated_aug', action='store_true',
+                        help='Use repeated augmentation (sample each image 3x per epoch with different augmentations)')
 
     # Training Recipe Presets
     parser.add_argument('--timm_recipe', action='store_true',
                         help='Use TIMM recipe: AdamW, RandAugment, Mixup/CutMix, label smoothing, EMA')
+    parser.add_argument('--shvit_recipe', action='store_true',
+                        help='Use SHViT recipe: AdamW, RandAugment, AGC, repeated aug, EMA 0.99996')
     parser.add_argument('--deit3_recipe', action='store_true',
                         help='Use DeiT III recipe: LAMB, 3-Augment, BCE loss, no label smoothing')
 
@@ -301,6 +335,26 @@ def main():
         args.random_erase_prob = 0.0
         args.ema_decay = 0.0  # DeiT III doesn't use EMA
         print("Using DeiT III recipe: LAMB optimizer, 3-Augment, BCE loss")
+
+    # Apply SHViT recipe defaults (from published SHViT paper)
+    elif args.shvit_recipe:
+        args.optimizer = 'adamw'
+        args.lr = 1e-3
+        args.weight_decay = 0.025
+        args.augmentation = 'randaugment'
+        args.randaugment_num_ops = 2
+        args.randaugment_magnitude = 9
+        args.mixup_alpha = 0.8
+        args.cutmix_alpha = 1.0
+        args.label_smoothing = 0.1
+        args.ema_decay = 0.99996
+        args.random_erase_prob = 0.25
+        args.color_jitter = 0.4
+        args.grad_clip_mode = 'agc'
+        args.grad_clip = 0.02
+        args.min_lr = 1e-5
+        args.repeated_aug = True
+        print("Using SHViT recipe: AdamW, RandAugment, AGC, repeated aug, EMA 0.99996, wd=0.025")
 
     # Apply TIMM recipe defaults
     elif args.timm_recipe:
@@ -406,10 +460,18 @@ def main():
         'rope_mode': args.rope_mode,
         'use_dwconv': use_dwconv,
         'output_act': args.output_act,
+        'short_conv_size': args.short_conv_size,
+        'short_conv_spatial_size': args.short_conv_spatial_size,
+        'delta_key_dim': args.delta_key_dim,
+        'output_norm': args.output_norm,
+        'gate_type': args.gate_type_cssm,
+        'block_norm': args.block_norm,
     }
 
     if args.model == 'cssm_shvit':
         model_kwargs.update(cssm_kwargs)
+        # Apply uniform kernel_size to all CSSM stages
+        model_kwargs['kernel_sizes'] = (args.kernel_size,) * 4
         if args.model_size == 's1':
             model = cssm_shvit_s1(**model_kwargs)
         elif args.model_size == 's2':
@@ -474,6 +536,7 @@ def main():
             split='train',
             batch_size=global_batch_size,
             image_size=args.image_size,
+            repeated_aug=args.repeated_aug,
         )
         val_loader = get_tfrecord_imagenet_loader(
             tfrecord_dir=args.tfrecord_dir,
@@ -540,6 +603,9 @@ def main():
         total_steps=total_steps,
         warmup_steps=warmup_steps,
         grad_clip=args.grad_clip,
+        grad_clip_mode=args.grad_clip_mode,
+        agc_clip_factor=args.agc_clip_factor,
+        min_lr=args.min_lr,
         image_size=args.image_size,
         optimizer_name=args.optimizer,
     )
