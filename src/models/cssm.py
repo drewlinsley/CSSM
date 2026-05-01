@@ -10,6 +10,7 @@ numerically stable log-space computation.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from .math import (cssm_scalar_scan_op, cssm_matrix_scan_op, cssm_3x3_matrix_scan_op,
@@ -1485,16 +1486,18 @@ class TransformerCSSM(nn.Module):
     block_size: int = 1
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, injected_qkv_spatial=None) -> jnp.ndarray:
         """
         Forward pass with minimal Q/K/A dynamics.
 
         Args:
             x: Input tensor of shape (B, T, H, W, C)
+            injected_qkv_spatial: Unused; accepted for API compatibility with SimpleCSSM dispatch.
 
         Returns:
             Output tensor of shape (B, T, H, W, C)
         """
+        del injected_qkv_spatial
         B, T, H, W, C = x.shape
         W_freq = W // 2 + 1
 
@@ -4322,6 +4325,17 @@ class GatedDeltaNetCSSM(nn.Module):
     int_attention_mode: str = 'none'     # 'none', 'spectral', 'elementwise', 'qk' — spatial attention on GDN output
     attn_kernel_size: int = 7            # Spatial kernel for spectral attention state (gdn_int)
     int_attn_dim: int = 16              # Hidden dim for Q·K attention projections (gdn_int_qk)
+    # --- Static-image fast path (ImageNet optimization) ---
+    static_image_fast_path: bool = False  # When True and input is 4D (B,H,W,C), skip T-replication
+    num_timesteps: int = 0                # Required when static_image_fast_path=True (scan length)
+    # --- Temporal SSL projection head (sown intermediates for contrastive loss) ---
+    ssl_proj_dim: int = 0                 # 0=disabled. >0 enables MLP projection + L2-norm + sow
+    # --- gate_proj bias init. 0.0 is the tog9av97 75% run value — bisect on
+    # 2026-04-16 confirmed 1.0 regresses epoch-1 val by ~2× on ImageNet.
+    gate_proj_bias_init: float = 0.0
+    # Mixed precision: bf16 compute for Dense/Conv, fp32 weight storage, fp32 FFT.
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, injected_qkv_spatial=None) -> jnp.ndarray:
@@ -4329,12 +4343,345 @@ class GatedDeltaNetCSSM(nn.Module):
         Forward pass.
 
         Args:
-            x: Input tensor of shape (B, T, H, W, C)
+            x: Input tensor of shape (B, T, H, W, C) — or (B, H, W, C) when
+               static_image_fast_path=True.
             injected_qkv_spatial: Unused, for API compatibility.
 
         Returns:
-            Output tensor of shape (B, T, H, W, C)
+            Output tensor of shape (B, T, H, W, C), or (B, H, W, C) in fast path.
         """
+        if self.static_image_fast_path and x.ndim == 4:
+            # --- Preconditions for fast path correctness ---
+            assert self.ssl_proj_dim == 0, \
+                "static_image_fast_path is incompatible with ssl_proj_dim>0 " \
+                "(SSL needs per-timestep features which the fast path collapses)"
+            assert self.short_conv_size == 0, \
+                "static_image_fast_path requires short_conv_size=0"
+            assert self.use_input_gates is False, \
+                "static_image_fast_path requires use_input_gates=False"
+            assert self.rope_mode == 'none', \
+                "static_image_fast_path requires rope_mode='none'"
+            assert self.position_independent_gates is False, \
+                "static_image_fast_path requires position_independent_gates=False"
+            assert self.int_attention_mode == 'none', \
+                "static_image_fast_path requires int_attention_mode='none'"
+            assert self.learned_init is False, \
+                "static_image_fast_path requires learned_init=False"
+            assert self.num_timesteps > 0, \
+                "static_image_fast_path requires num_timesteps > 0 to be passed explicitly"
+
+            B_, H_, W_, C_ = x.shape
+            T_ = self.num_timesteps
+            W_freq_ = W_ // 2 + 1
+            d_k_ = self.delta_key_dim
+            d_v_ = d_k_
+            n_h_ = C_ // d_k_
+            assert C_ % d_k_ == 0, f"channels={C_} must be divisible by delta_key_dim={d_k_}"
+
+            # =============================================================
+            # T-INVARIANT WORK (no T axis)
+            # =============================================================
+
+            # 1. Spatial kernel FFT → W_hat (n_h, H, W_freq)
+            k_shape_ = (n_h_, self.kernel_size, self.kernel_size)
+
+            def _pad_kernel_fp(k_spatial):
+                pad_h = max(0, (H_ - self.kernel_size) // 2)
+                pad_w = max(0, (W_ - self.kernel_size) // 2)
+                pad_h_after = H_ - self.kernel_size - pad_h
+                pad_w_after = W_ - self.kernel_size - pad_w
+                if self.kernel_size > H_ or self.kernel_size > W_:
+                    start_h = (self.kernel_size - H_) // 2
+                    start_w = (self.kernel_size - W_) // 2
+                    return k_spatial[:, start_h:start_h+H_, start_w:start_w+W_]
+                else:
+                    return jnp.pad(k_spatial,
+                                   ((0, 0),
+                                    (pad_h, max(0, pad_h_after)),
+                                    (pad_w, max(0, pad_w_after))),
+                                   mode='constant')
+
+            kernel_fp = self.param('kernel', nn.initializers.xavier_normal(), k_shape_)
+            k_padded_fp = _pad_kernel_fp(kernel_fp)
+            W_hat_fp = jnp.fft.rfft2(k_padded_fp, axes=(1, 2))  # (n_h, H, W_freq)
+            if not self.no_spectral_clamp:
+                W_hat_fp = _stable_spectral_magnitude(W_hat_fp, rho=self.spectral_rho)
+            W_hat_fp = W_hat_fp.astype(jnp.complex64)
+
+            # 2. QKV projection (shared with slow path: same name='qkv_proj')
+            if self.qkv_conv_size > 1:
+                if self.qkv_conv_separable:
+                    qkv_proj = nn.Conv(
+                        C_, kernel_size=(self.qkv_conv_size, self.qkv_conv_size),
+                        feature_group_count=C_, padding='SAME',
+                        dtype=self.dtype, param_dtype=self.param_dtype,
+                        name='qkv_dw'
+                    )(x)
+                    qkv_proj = nn.Dense(
+                        3 * C_,
+                        dtype=self.dtype, param_dtype=self.param_dtype,
+                        name='qkv_proj'
+                    )(qkv_proj)
+                else:
+                    qkv_proj = nn.Conv(
+                        3 * C_, kernel_size=(self.qkv_conv_size, self.qkv_conv_size),
+                        padding='SAME',
+                        dtype=self.dtype, param_dtype=self.param_dtype,
+                        name='qkv_proj'
+                    )(x)
+            else:
+                qkv_proj = nn.Dense(
+                    3 * C_,
+                    dtype=self.dtype, param_dtype=self.param_dtype,
+                    name='qkv_proj'
+                )(x)
+            # qkv_proj: (B, H, W, 3C)
+            q_in = qkv_proj[..., :C_]
+            k_in = qkv_proj[..., C_:2*C_]
+            v_in = qkv_proj[..., 2*C_:]
+
+            # 3. short_conv SKIPPED (precondition)
+            # 4. B_k, B_v SKIPPED (precondition use_input_gates=False)
+
+            # 5. Output gate projection (T-invariant: uses x directly)
+            # Bias +1: silu(z+1) ≈ 0.92 at init vs silu(z) ≈ 0.40, keeping the
+            # gate near pass-through so gradients flow through the CSSM from step 0
+            # (same principle as LSTM forget-gate bias init).
+            gate_val_fp = nn.Dense(
+                C_,
+                bias_init=nn.initializers.constant(self.gate_proj_bias_init),
+                dtype=self.dtype, param_dtype=self.param_dtype,
+                name='gate_proj'
+            )(x)  # (B, H, W, C)
+            if self.output_gate_act == 'silu':
+                gate_val_fp = jax.nn.silu(gate_val_fp)
+            else:
+                gate_val_fp = nn.sigmoid(gate_val_fp)
+
+            # 6. Reshape to heads. FFT requires real fp32/fp64 input; cast up
+            #    explicitly so bf16 inputs still produce complex64 specs.
+            q_heads_fp = q_in.reshape(B_, H_, W_, n_h_, d_k_).astype(jnp.float32)
+            k_heads_fp = k_in.reshape(B_, H_, W_, n_h_, d_k_).astype(jnp.float32)
+            v_heads_fp = v_in.reshape(B_, H_, W_, n_h_, d_v_).astype(jnp.float32)
+
+            # Transpose to (B, n_h, d_k, H, W) then rfft2
+            q_spec_fp = jnp.fft.rfft2(
+                q_heads_fp.transpose(0, 3, 4, 1, 2), axes=(3, 4)
+            )  # (B, n_h, d_k, H, W_freq) complex64
+            k_spec_fp = jnp.fft.rfft2(
+                k_heads_fp.transpose(0, 3, 4, 1, 2), axes=(3, 4)
+            )
+            v_spec_fp = jnp.fft.rfft2(
+                v_heads_fp.transpose(0, 3, 4, 1, 2), axes=(3, 4)
+            )
+
+            # 7. L2 norms (no T axis; adjust axes vs slow path)
+            def _spectral_l2_norm_fp(z):
+                # z shape (B, n_h, d_k, H, W_freq); normalize across (H, W_freq) = (3, 4)
+                if not self.use_spectral_l2_norm:
+                    return z
+                norm = jnp.sqrt(jnp.sum(jnp.abs(z) ** 2, axis=(3, 4), keepdims=True) + 1e-6)
+                return z / norm
+
+            def _key_vector_l2_norm_fp(z):
+                # axis 2 is d_k in 5D fast-path layout
+                norm = jnp.sqrt(jnp.sum(jnp.abs(z) ** 2, axis=2, keepdims=True) + 1e-6)
+                return z / norm
+
+            k_hat_norm_fp = _key_vector_l2_norm_fp(_spectral_l2_norm_fp(k_spec_fp))
+            q_hat_norm_fp = _spectral_l2_norm_fp(q_spec_fp)
+            v_hat_fp = v_spec_fp
+            # All shape (B, n_h, d_k/d_v, H, W_freq)
+
+            # 8. k_outer, vk_outer (T-invariant)
+            # k_hat_norm_fp[..., :, None, :, :] has axes (B, n_h, d_k, 1, H, W_freq)
+            # k_hat_norm_fp[..., None, :, :, :] has axes (B, n_h, 1, d_k, H, W_freq)
+            k_outer_fp = (k_hat_norm_fp[..., :, None, :, :]
+                          * jnp.conj(k_hat_norm_fp[..., None, :, :, :]))
+            # shape (B, n_h, d_k, d_k, H, W_freq)
+            vk_outer_fp = (v_hat_fp[..., :, None, :, :]
+                           * jnp.conj(k_hat_norm_fp[..., None, :, :, :]))
+            # shape (B, n_h, d_v, d_k, H, W_freq)
+
+            # =============================================================
+            # T-VARYING WORK (cheap: just gate ctx + Dense)
+            # =============================================================
+
+            # 9. ctx → broadcast to T → temporal encoding
+            ctx_static = x.mean(axis=(1, 2))              # (B, C)
+            ctx_T = jnp.broadcast_to(
+                ctx_static[:, None, :], (B_, T_, C_)
+            )                                              # (B, T, C)
+            if self.rope_mode == 'learned_t':
+                t_embed = self.param('temporal_embed',
+                                     nn.initializers.zeros, (T_, C_))
+                ctx_T = ctx_T + t_embed[None, :, :]
+            else:
+                ctx_T = apply_temporal_rope_to_context(ctx_T, base=self.rope_base)
+
+            # 10. alpha_t, beta_t via gate Dense layers (inline, gate_type-aware)
+            _gate_dense_kw = dict(dtype=self.dtype, param_dtype=self.param_dtype)
+
+            def _gate_fast(name, bounded=False):
+                if self.gate_type == 'channel':
+                    raw = nn.sigmoid(nn.Dense(n_h_, name=name, **_gate_dense_kw)(ctx_T))  # (B, T, n_h)
+                    raw = raw.reshape(B_, T_, n_h_, 1, 1)               # (B, T, n_h, 1, 1)
+                    return 0.1 + 0.89 * raw if bounded else raw
+                elif self.gate_type == 'factored':
+                    row = nn.Dense(H_, name=f'{name}_h', **_gate_dense_kw)(ctx_T)         # (B, T, H)
+                    col = nn.Dense(W_freq_, name=f'{name}_w', **_gate_dense_kw)(ctx_T)    # (B, T, W_freq)
+                    raw = nn.sigmoid(row[..., :, None] + col[..., None, :])  # (B, T, H, W_freq)
+                    raw = raw.reshape(B_, T_, 1, H_, W_freq_)
+                    return 0.1 + 0.89 * raw if bounded else raw
+                elif self.gate_type == 'scalar':
+                    raw = nn.sigmoid(nn.Dense(1, name=name, **_gate_dense_kw)(ctx_T))     # (B, T, 1)
+                    raw = raw.reshape(B_, T_, 1, 1, 1)
+                    return 0.1 + 0.89 * raw if bounded else raw
+                else:  # 'dense'
+                    n_gate_ = H_ * W_freq_
+                    raw = nn.sigmoid(nn.Dense(n_gate_, name=name, **_gate_dense_kw)(ctx_T))
+                    raw = raw.reshape(B_, T_, 1, H_, W_freq_)
+                    return 0.1 + 0.89 * raw if bounded else raw
+
+            alpha_fp = _gate_fast('alpha', bounded=True)   # (B, T, *, *, *)  bf16 or fp32
+            beta_fp = _gate_fast('beta')
+
+            # Cast gates to fp32 then complex64 for the spectral math below.
+            alpha_fp = alpha_fp.astype(jnp.float32)
+            beta_fp = beta_fp.astype(jnp.float32)
+
+            # Diagnostic sow: for analyses that measure how gates evolve across
+            # timesteps (e.g. are they flat or t-varying?).
+            self.sow('intermediates', 'alpha_t', alpha_fp)
+            self.sow('intermediates', 'beta_t', beta_fp)
+
+            # 11. Build M_seq, Delta_seq
+            if self.gate_type == 'channel':
+                alpha_bc = alpha_fp[..., None, None]       # (B, T, n_h, 1, 1, 1, 1)
+                beta_bc = beta_fp[..., None, None]
+            else:
+                # alpha_fp shape (B, T, 1, H, W_freq) → insert (d_k, d_k) axes
+                alpha_bc = alpha_fp[:, :, :, None, None, :, :]  # (B, T, 1, 1, 1, H, W_freq)
+                beta_bc = beta_fp[:, :, :, None, None, :, :]
+
+            # W_hat: (n_h, H, W_freq) → (1, 1, n_h, 1, 1, H, W_freq)
+            W_hat_bc = W_hat_fp[None, None, :, None, None, :, :]
+            # k_outer_fp: (B, n_h, d_k, d_k, H, W_freq) → insert T=1 axis at position 1
+            k_outer_bc = k_outer_fp[:, None]    # (B, 1, n_h, d_k, d_k, H, W_freq)
+            vk_outer_bc = vk_outer_fp[:, None]  # (B, 1, n_h, d_v, d_k, H, W_freq)
+
+            I_dk = jnp.eye(d_k_, dtype=jnp.complex64).reshape(1, 1, 1, d_k_, d_k_, 1, 1)
+
+            M_seq = alpha_bc.astype(jnp.complex64) * W_hat_bc * (I_dk - beta_bc * k_outer_bc)
+            # M_seq shape: (B, T, n_h, d_k, d_k, H, W_freq)
+            Delta_seq = beta_bc * vk_outer_bc
+            # Delta_seq shape: (B, T, n_h, d_v, d_k, H, W_freq)
+
+            # 12. Match slow path's layout for scan
+            # Transpose M: (0,1,2,5,6,3,4) → (B, T, n_h, H, W_freq, d_k, d_k)
+            M_scan_fp = M_seq.transpose(0, 1, 2, 5, 6, 3, 4)
+            # Transpose Delta: (0,1,2,3,5,6,4) → (B, T, n_h, d_v, H, W_freq, d_k)
+            Delta_scan_fp = Delta_seq.transpose(0, 1, 2, 3, 5, 6, 4)
+            # Repeat M along d_v head axis
+            M_scan_rep_fp = jnp.repeat(M_scan_fp, d_v_, axis=2)
+            # (B, T, n_h*d_v, H, W_freq, d_k, d_k)
+            Delta_scan_flat_fp = Delta_scan_fp.reshape(
+                B_, T_, n_h_ * d_v_, H_, W_freq_, d_k_
+            )
+
+            # 13. Sequential scan in "linear split" complex32 (bf16 real + bf16 imag).
+            # Halves the scan carry memory bandwidth vs complex64; matmul still
+            # promotes to fp32 internally for precision.
+            M_xs = jnp.moveaxis(M_scan_rep_fp, 1, 0)       # complex64 (T, B, ...)
+            U_xs = jnp.moveaxis(Delta_scan_flat_fp, 1, 0)  # complex64
+
+            M_re_xs, M_im_xs = complex64_to_linear_split(M_xs, jnp.bfloat16)
+            U_re_xs, U_im_xs = complex64_to_linear_split(U_xs, jnp.bfloat16)
+
+            def _scan_step_ls(carry, inp):
+                S_re, S_im = carry
+                M_re, M_im, U_re, U_im = inp
+                # Complex matmul M @ S:
+                #   (M_re + j M_im) @ (S_re + j S_im)
+                #   = (M_re@S_re - M_im@S_im) + j (M_re@S_im + M_im@S_re)
+                # Promote to fp32 for the einsum, cast back to bf16.
+                Mr = M_re.astype(jnp.float32)
+                Mi = M_im.astype(jnp.float32)
+                Sr = S_re.astype(jnp.float32)
+                Si = S_im.astype(jnp.float32)
+                out_re_f32 = (
+                    jnp.einsum('...ij,...j->...i', Mr, Sr)
+                    - jnp.einsum('...ij,...j->...i', Mi, Si)
+                )
+                out_im_f32 = (
+                    jnp.einsum('...ij,...j->...i', Mr, Si)
+                    + jnp.einsum('...ij,...j->...i', Mi, Sr)
+                )
+                new_S_re = (out_re_f32 + U_re.astype(jnp.float32)).astype(jnp.bfloat16)
+                new_S_im = (out_im_f32 + U_im.astype(jnp.float32)).astype(jnp.bfloat16)
+                return (new_S_re, new_S_im), None
+
+            S0_re = jnp.zeros_like(U_re_xs[0])
+            S0_im = jnp.zeros_like(U_im_xs[0])
+            # unroll=T compiles into a straight-line graph so XLA can fuse all
+            # the 2x2 einsums with the surrounding rfft/irfft ops.
+            (S_final_re, S_final_im), _ = jax.lax.scan(
+                _scan_step_ls, (S0_re, S0_im),
+                (M_re_xs, M_im_xs, U_re_xs, U_im_xs),
+                unroll=T_,
+            )
+            # Cast back to complex64 for the readout einsum + irfft2.
+            S_final = linear_split_to_complex64(S_final_re, S_final_im)
+            # S_final: (B, n_h*d_v, H, W_freq, d_k)
+
+            # 14. Readout: o = S_final @ q_hat_norm (T-invariant q)
+            S_final_r = S_final.reshape(B_, n_h_, d_v_, H_, W_freq_, d_k_)
+            # q_hat_norm_fp: (B, n_h, d_k, H, W_freq)
+            # → transpose (0,1,3,4,2) → (B, n_h, H, W_freq, d_k)
+            # → insert d_v broadcast axis at position 2 → (B, n_h, 1, H, W_freq, d_k)
+            q_read_fp = q_hat_norm_fp.transpose(0, 1, 3, 4, 2)[:, :, None, :, :, :]
+            o_hat_fp = jnp.sum(S_final_r * q_read_fp, axis=-1)  # (B, n_h, d_v, H, W_freq)
+            o_hat_fp = o_hat_fp.reshape(B_, C_, H_, W_freq_)
+
+            # 15. Optional cross-freq conv (same as slow path, but no T dim)
+            if self.cross_freq_conv_size > 0:
+                o_flat_fp = o_hat_fp.reshape(B_ * C_ * H_, W_freq_)
+                o_re = o_flat_fp.real[..., None]
+                o_im = o_flat_fp.imag[..., None]
+                pad = self.cross_freq_conv_size // 2
+                o_re = jnp.pad(o_re, ((0, 0), (pad, pad), (0, 0)))
+                o_im = jnp.pad(o_im, ((0, 0), (pad, pad), (0, 0)))
+                o_re = nn.Conv(1, kernel_size=(self.cross_freq_conv_size,),
+                               padding='VALID',
+                               dtype=self.dtype, param_dtype=self.param_dtype,
+                               name='cross_freq_re')(o_re)
+                o_im = nn.Conv(1, kernel_size=(self.cross_freq_conv_size,),
+                               padding='VALID',
+                               dtype=self.dtype, param_dtype=self.param_dtype,
+                               name='cross_freq_im')(o_im)
+                o_hat_fp = (o_re[..., 0] + 1j * o_im[..., 0]).reshape(B_, C_, H_, W_freq_)
+
+            # 16. iFFT → (B, C, H, W) → transpose → (B, H, W, C). irfft2 returns
+            # fp32; cast back to compute dtype for the downstream Dense ops.
+            o_spatial_fp = jnp.fft.irfft2(o_hat_fp, s=(H_, W_), axes=(2, 3))
+            output_fp = o_spatial_fp.transpose(0, 2, 3, 1).astype(self.dtype)
+
+            # 17. Output norm (same param names)
+            if self.output_norm == 'rms':
+                rms_scale_fp = self.param('rms_scale', nn.initializers.ones, (C_,))
+                output_fp = _rms_norm(output_fp, rms_scale_fp.astype(self.dtype))
+            elif self.output_norm == 'layer':
+                output_fp = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype,
+                                         name='output_layernorm')(output_fp)
+
+            # 18. Output gate multiply + output projection
+            output_fp = output_fp * gate_val_fp
+            return nn.Dense(
+                C_,
+                dtype=self.dtype, param_dtype=self.param_dtype,
+                name='output_proj'
+            )(output_fp)
+
         B, T, H, W, C = x.shape
         W_freq = W // 2 + 1
         d_k = self.delta_key_dim
@@ -4438,7 +4785,13 @@ class GatedDeltaNetCSSM(nn.Module):
         gate_input = x_raw if x_raw is not None else x
         ctx = gate_input.mean(axis=(2, 3))  # (B, T, C)
         if x_raw is None:
-            ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+            if self.rope_mode == 'learned_t':
+                T_d, C_d = ctx.shape[-2], ctx.shape[-1]
+                t_embed = self.param('temporal_embed',
+                                     nn.initializers.zeros, (T_d, C_d))
+                ctx = ctx + t_embed[None, :, :]
+            else:
+                ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
         n_gate = H * W_freq
         _spatial_gates = self.gate_type in ('conv', 'channel', 'dense_decay')
 
@@ -4497,7 +4850,8 @@ class GatedDeltaNetCSSM(nn.Module):
         # =====================================================================
         # 5. OUTPUT GATE PROJECTION (NEW: computed early, SiLU or sigmoid)
         # =====================================================================
-        gate_val = nn.Dense(C, name='gate_proj')(x_flat)  # (B*T, H, W, C)
+        gate_val = nn.Dense(C, bias_init=nn.initializers.constant(self.gate_proj_bias_init),
+                             name='gate_proj')(x_flat)  # (B*T, H, W, C)
         gate_val = gate_val.reshape(B, T, H, W, C)
         if self.output_gate_act == 'silu':
             gate_val = jax.nn.silu(gate_val)
@@ -4509,6 +4863,10 @@ class GatedDeltaNetCSSM(nn.Module):
         # =====================================================================
         alpha = _gate('alpha', bounded=True)    # [0.1, 0.99]
         beta = _gate('beta')                     # [0, 1]
+
+        # Diagnostic sow for per-t gate variation analyses.
+        self.sow('intermediates', 'alpha_t', alpha)
+        self.sow('intermediates', 'beta_t', beta)
 
         # =====================================================================
         # 7. RESHAPE TO HEADS + FFT + L2 NORM
@@ -4766,6 +5124,19 @@ class GatedDeltaNetCSSM(nn.Module):
 
         # Output gate
         output = output * gate_val
+
+        # --- Temporal SSL projection (sown for LeJEPA-recurrent loss) ---
+        # Un-normalized: SIGReg needs embeddings that can match N(0, I) including
+        # both moments and shape. L2-normalizing forces them onto the unit sphere
+        # and would mask collapse at z=0.
+        if self.ssl_proj_dim > 0:
+            pooled_t = output.mean(axis=(2, 3)).astype(jnp.float32)            # (B, T, C)
+            pooled_t = nn.Dense(self.ssl_proj_dim * 4, name='ssl_proj_in',
+                                param_dtype=jnp.float32)(pooled_t)
+            pooled_t = nn.gelu(pooled_t)
+            pooled_t = nn.Dense(self.ssl_proj_dim, name='ssl_proj_out',
+                                param_dtype=jnp.float32)(pooled_t)            # (B, T, P)
+            self.sow('intermediates', 'cssm_temporal_proj', pooled_t)
 
         return nn.Dense(C, name='output_proj')(output)
 
@@ -5203,6 +5574,409 @@ class ConvSSMCSSM(nn.Module):
         return output - x_in
 
 
+def _fft_conv_1d_per_channel(x, k, axis):
+    """Per-channel 1D circular convolution via FFT along `axis`.
+
+    x: (..., L_axis, ..., C)  real
+    k: (C, L_axis)             real
+    Returns y of same shape as x.
+    """
+    L = k.shape[-1]
+    Xf = jnp.fft.rfft(x, n=L, axis=axis)                                 # (..., L//2+1, ..., C)
+    Kf = jnp.fft.rfft(k, n=L, axis=-1)                                   # (C, L//2+1)
+    shape_bc = [1] * x.ndim
+    shape_bc[axis] = Kf.shape[-1]
+    shape_bc[-1] = Kf.shape[0]
+    Kf_bc = jnp.transpose(Kf, (1, 0)).reshape(shape_bc)                  # broadcast-ready
+    Yf = Xf * Kf_bc
+    return jnp.fft.irfft(Yf, n=L, axis=axis)
+
+
+class _S4DKernel1D(nn.Module):
+    """1D S4D diagonal-complex state-space kernel. Returns real kernel (H, L).
+
+    S4D (Gu et al. 2022, "On the Parameterization and Initialization of Diagonal
+    State Space Models") is the diagonal variant of S4 — drops the DPLR low-rank
+    correction while keeping almost all the performance on LRA/continuous signals.
+    We use it here as the per-axis kernel for S4ND.
+
+    State stored as conjugate pairs (half the total state dim); output kernel
+    recovered via 2 * Re(sum). All complex math in complex64, real cast at end.
+
+    Fields:
+      H: channels (one SSM per channel)
+      N: total state dim (half is stored; output doubled via conjugate symmetry)
+      L: output kernel length
+    """
+    H: int
+    N: int
+    L: int
+
+    @nn.compact
+    def __call__(self):
+        half_N = max(self.N // 2, 1)
+
+        # Λ = -exp(Λ_log) + i * Λ_im. Negative real part → contractive discrete kernel.
+        Lambda_log = self.param(
+            'Lambda_log',
+            nn.initializers.constant(jnp.log(0.5)),
+            (half_N,),
+        )
+        Lambda_imag = self.param(
+            'Lambda_imag',
+            lambda k, s: jax.random.uniform(k, s, minval=0.0, maxval=2.0 * jnp.pi),
+            (half_N,),
+        )
+        # B and C stored as (2, half_N) / (H, 2, half_N) real (= re/im split).
+        B_ri = self.param(
+            'B_ri',
+            lambda k, s: jax.random.normal(k, s) / jnp.sqrt(2.0 * half_N),
+            (2, half_N),
+        )
+        C_ri = self.param(
+            'C_ri',
+            lambda k, s: jax.random.normal(k, s) / jnp.sqrt(half_N),
+            (self.H, 2, half_N),
+        )
+        log_Delta = self.param(
+            'log_Delta',
+            lambda k, s: jax.random.uniform(
+                k, s, minval=jnp.log(1e-3), maxval=jnp.log(1e-1)),
+            (self.H,),
+        )
+
+        Lambda_log = Lambda_log.astype(jnp.float32)
+        Lambda_imag = Lambda_imag.astype(jnp.float32)
+        Lambda = (-jnp.exp(Lambda_log) + 1j * Lambda_imag).astype(jnp.complex64)  # (half_N,)
+        B_cplx = (B_ri[0] + 1j * B_ri[1]).astype(jnp.complex64)                  # (half_N,)
+        C_cplx = (C_ri[:, 0] + 1j * C_ri[:, 1]).astype(jnp.complex64)            # (H, half_N)
+        Delta = jnp.exp(log_Delta.astype(jnp.float32))                           # (H,)
+
+        # Bilinear (Tustin) discretization:
+        #   Ā = (1 + Δ/2 · Λ) / (1 - Δ/2 · Λ);   B̄ = Δ B / (1 - Δ/2 · Λ)
+        dL = (Delta[:, None] * Lambda[None, :]).astype(jnp.complex64)            # (H, half_N)
+        A_bar = (1.0 + 0.5 * dL) / (1.0 - 0.5 * dL)                              # (H, half_N)
+        B_bar = Delta[:, None].astype(jnp.complex64) * B_cplx[None, :] / (1.0 - 0.5 * dL)
+
+        # K̄[l] = C̄ Ā^l B̄ summed over state. Use log-powered Ā for speed.
+        # (H, half_N, L): A_bar^l via exp(l * log Ā).
+        log_A = jnp.log(A_bar + 1e-12)                                           # (H, half_N) complex
+        powers = jnp.arange(self.L, dtype=jnp.float32)
+        A_pow = jnp.exp(log_A[..., None] * powers[None, None, :])                # (H, half_N, L)
+        # kernel[h, l] = sum_n C[h,n] * A_bar^l[h,n] * B_bar[h,n]
+        k_cplx = jnp.einsum('hn,hnl,hn->hl', C_cplx, A_pow, B_bar)               # (H, L)
+        return (2.0 * jnp.real(k_cplx)).astype(jnp.float32)                      # real (H, L)
+
+
+class S4NDCSSM(nn.Module):
+    """S4ND — separable per-axis S4 along spatial dims (2D variant).
+
+    Reference: Nguyen et al. "S4ND: Modeling Images and Videos as Multidimensional
+    Signals Using State Spaces" (NeurIPS 2022). The paper's S4ND uses DPLR;
+    this port uses the simpler S4D (diagonal-only) parameterization per axis,
+    which is functionally equivalent when not using HiPPO-LegS init.
+
+    Architecture:
+      1. Per-channel 1D S4D kernel for H axis → (C, H).
+      2. Per-channel 1D S4D kernel for W axis → (C, W).
+      3. Apply separable 2D convolution via two 1D FFT convs (H then W).
+      4. Optional bidirectional branch (reversed kernels) summed in.
+      5. Per-channel D-term skip scale.
+      6. Output projection Dense(C).
+
+    No temporal state: each of the T frames is processed independently
+    (frames are the batch axis here). For pathfinder (T=1) this is the natural
+    single-frame spatial encoder.
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    d_state: int = 64
+    bidirectional: bool = True
+    dropout: float = 0.0
+    # Unused CSSM interface kwargs (accepted for compat with SimpleCSSM dispatch).
+    kernel_size: int = 3
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        # Per-axis kernels: one per channel, per axis.
+        kH = _S4DKernel1D(H=C, N=self.d_state, L=H, name='kH')()             # (C, H)
+        kW = _S4DKernel1D(H=C, N=self.d_state, L=W, name='kW')()             # (C, W)
+
+        # Reshape into (B*T, H, W, C) for spatial convolution.
+        xf = x.reshape(B * T, H, W, C).astype(jnp.float32)
+
+        # Forward branch: FFT conv along H, then W.
+        yf = _fft_conv_1d_per_channel(xf, kH, axis=1)
+        yf = _fft_conv_1d_per_channel(yf, kW, axis=2)
+
+        if self.bidirectional:
+            # Reverse branch: flip kernels along length axis.
+            kH_r = kH[:, ::-1]
+            kW_r = kW[:, ::-1]
+            yf_bw = _fft_conv_1d_per_channel(xf, kH_r, axis=1)
+            yf_bw = _fft_conv_1d_per_channel(yf_bw, kW_r, axis=2)
+            yf = yf + yf_bw
+
+        # Per-channel D-term skip scale (standard S4 D).
+        D = self.param('D', nn.initializers.ones, (C,))
+        yf = yf + D[None, None, None, :].astype(jnp.float32) * xf
+
+        yf = yf.reshape(B, T, H, W, C)
+        if self.dropout > 0:
+            yf = nn.Dropout(rate=self.dropout, deterministic=False)(yf)
+
+        # Cast back and project.
+        y = yf.astype(x.dtype)
+        y = nn.Dense(C, name='out_proj')(y.reshape(B * T, H, W, C))
+        y = y.reshape(B, T, H, W, C)
+        return y - x_in
+
+
+class _S4NDLegSKernel1D(nn.Module):
+    """1D S4 kernel with HiPPO-LegS DPLR initialization (canonical S4-LegS).
+
+    Faithful re-implementation of the S4 LegS kernel from Gu et al. 2021/2022.
+    Uses conjugate-pair compression (store half_N = N // 2 complex state
+    components; full-N kernel recovered via `2 · Re(...)`) — same convention
+    as `_S4DKernel1D`. DPLR rank-1 correction acts in the half-N space; for
+    real-valued P, Q this gives the correct full-N kernel under the conjugate
+    trick.
+
+    HiPPO-LegS init (Gu 2022 Sec 4.3 / S4 paper Appendix C):
+        Λ_n     = -1/2 + i·π·n   (n = 0..half_N-1)   eigenvalues
+        P_n=Q_n = √(n + 1/2)                          rank-1 correction
+        B_n     = √(2n + 1)                           LegS impulse measure
+        Δ_log   ~ U[log 1e-3, log 1e-1]               per-channel log step
+
+    Discretization: bilinear (Tustin)
+        Ā = (I - Δ/2 A)⁻¹ (I + Δ/2 A)
+        B̄ = (I - Δ/2 A)⁻¹ Δ B
+    Kernel: K[l] = 2 · Re(Cᵀ Ā^l B̄) via brute-force `lax.scan`.
+    """
+    H: int      # channels
+    N: int      # total state dim (half_N = N // 2 stored)
+    L: int      # output kernel length
+
+    @nn.compact
+    def __call__(self):
+        half_N = max(self.N // 2, 1)
+        n_idx = jnp.arange(half_N, dtype=jnp.float32)
+
+        # HiPPO-LegS init (in conjugate-paired half-N representation).
+        Lambda_log_init = jnp.log(jnp.full((half_N,), 0.5))   # -log(re(Λ)) → re(Λ) = -1/2
+        Lambda_im_init  = jnp.pi * n_idx                       # iπn
+        PQ_init         = jnp.sqrt(n_idx + 0.5)                # P_n = Q_n = √(n+1/2)
+        B_init          = jnp.sqrt(2.0 * n_idx + 1.0)          # B_n = √(2n+1) (LegS measure)
+
+        Lambda_log = self.param('Lambda_log',
+            lambda k, s: Lambda_log_init, (half_N,))
+        Lambda_im = self.param('Lambda_im',
+            lambda k, s: Lambda_im_init, (half_N,))
+        P_real = self.param('P', lambda k, s: PQ_init, (half_N,))
+        Q_real = self.param('Q', lambda k, s: PQ_init, (half_N,))
+        B_real = self.param('B', lambda k, s: B_init, (half_N,))
+        # C is per-channel complex (re/im split).
+        C_ri = self.param('C_ri',
+            lambda k, s: jax.random.normal(k, s) / jnp.sqrt(half_N),
+            (self.H, 2, half_N))
+        log_Delta = self.param('log_Delta',
+            lambda k, s: jax.random.uniform(
+                k, s, minval=jnp.log(1e-3), maxval=jnp.log(1e-1)),
+            (self.H,))
+
+        # Build complex tensors. Re(Λ) is forced negative for stability.
+        Lambda_re = -jnp.exp(Lambda_log.astype(jnp.float32))
+        Lambda    = (Lambda_re + 1j * Lambda_im.astype(jnp.float32)).astype(jnp.complex64)
+        P_c       = P_real.astype(jnp.complex64)
+        Q_c       = Q_real.astype(jnp.complex64)
+        B_c       = B_real.astype(jnp.complex64)
+        C_c       = (C_ri[:, 0] + 1j * C_ri[:, 1]).astype(jnp.complex64)  # (H, half_N)
+        Delta     = jnp.exp(log_Delta.astype(jnp.float32))                # (H,)
+
+        # DPLR matrix in half_N complex space: A = diag(Λ) - P Qᵀ.
+        A_full = jnp.diag(Lambda) - jnp.outer(P_c, Q_c)                   # (half_N, half_N)
+        I_N    = jnp.eye(half_N, dtype=jnp.complex64)
+
+        # Per-channel kernel via bilinear discretization + brute-force scan.
+        def kernel_per_channel(dt, C_h):
+            dt_c   = dt.astype(jnp.complex64)
+            M_lhs  = I_N - 0.5 * dt_c * A_full
+            M_rhs  = I_N + 0.5 * dt_c * A_full
+            A_bar  = jnp.linalg.solve(M_lhs, M_rhs)                       # (half_N, half_N)
+            B_bar  = jnp.linalg.solve(M_lhs, dt_c * B_c)                  # (half_N,)
+
+            # K[l] = C_hᵀ Ā^l B̄  for l = 0..L-1; h_0 = B̄.
+            def step(h, _):
+                k_l = jnp.dot(C_h, h)
+                h_next = A_bar @ h
+                return h_next, k_l
+            _, K_l = jax.lax.scan(step, B_bar, None, length=self.L)
+            return K_l                                                     # (L,) complex
+
+        K_complex = jax.vmap(kernel_per_channel)(Delta, C_c)               # (H, L)
+        # Conjugate-pair symmetry: full-N real kernel = 2 · Re(half-N complex).
+        return (2.0 * K_complex.real).astype(jnp.float32)                  # (H, L)
+
+
+class S4NDFullCSSM(nn.Module):
+    """True S4ND with HiPPO-LegS DPLR initialization.
+
+    Reference: Nguyen et al. "S4ND: Modeling Images and Videos as Multidimensional
+    Signals Using State Spaces" (NeurIPS 2022). Each spatial axis gets its own
+    1D S4 kernel parameterized as DPLR with HiPPO-LegS init — the full
+    canonical S4 family from Gu et al., not the simplified S4D-diagonal that
+    `S4NDCSSM` (cssm_type='s4nd') uses.
+
+    Architecture: identical to `S4NDCSSM` except the per-axis kernel is
+    `_S4NDLegSKernel1D` (DPLR + LegS) instead of `_S4DKernel1D` (diagonal +
+    random init).
+    """
+    channels: int
+    d_state: int = 64
+    bidirectional: bool = True
+    dropout: float = 0.0
+    # Unused CSSM interface kwargs (accepted for SimpleCSSM dispatch compat).
+    kernel_size: int = 3
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        kH = _S4NDLegSKernel1D(H=C, N=self.d_state, L=H, name='kH')()       # (C, H)
+        kW = _S4NDLegSKernel1D(H=C, N=self.d_state, L=W, name='kW')()       # (C, W)
+
+        xf = x.reshape(B * T, H, W, C).astype(jnp.float32)
+        yf = _fft_conv_1d_per_channel(xf, kH, axis=1)
+        yf = _fft_conv_1d_per_channel(yf, kW, axis=2)
+
+        if self.bidirectional:
+            kH_r = kH[:, ::-1]
+            kW_r = kW[:, ::-1]
+            yf_bw = _fft_conv_1d_per_channel(xf, kH_r, axis=1)
+            yf_bw = _fft_conv_1d_per_channel(yf_bw, kW_r, axis=2)
+            yf = yf + yf_bw
+
+        D = self.param('D', nn.initializers.ones, (C,))
+        yf = yf + D[None, None, None, :].astype(jnp.float32) * xf
+
+        yf = yf.reshape(B, T, H, W, C)
+        if self.dropout > 0:
+            yf = nn.Dropout(rate=self.dropout, deterministic=False)(yf)
+
+        y = yf.astype(x.dtype)
+        y = nn.Dense(C, name='out_proj')(y.reshape(B * T, H, W, C))
+        y = y.reshape(B, T, H, W, C)
+        return y - x_in
+
+
+class ConvS5CSSM(nn.Module):
+    """Official NVlabs ConvSSM / ConvS5: diagonal complex SSM with conv B/C
+    projections and associative parallel scan along T.
+
+    Reference: Smith et al. "Convolutional State Space Models for Long-Range
+    Spatiotemporal Modeling" (NeurIPS 2023, NVlabs/ConvSSM).
+
+    Key differences from our simpler `ConvSSMCSSM`:
+      - state_dim > 1 (N complex state components per spatial location per channel)
+      - Complex diagonal Λ (decay + oscillation), not real sigmoid scalar
+      - Conv-parameterized B and C (3x3 or 5x5 depthwise-group Conv)
+      - Associative parallel scan (same contract — uses `direct_scalar_scan_op`)
+
+    Architecture:
+      1. Per-state-component complex poles Λ = -exp(a_log) + i * a_imag.
+      2. Per-channel log-step Δ; discretize via ZOH: Ā[c,n] = exp(Δ[c] · Λ[n]).
+      3. B_bar, C_bar = conv(x) with (C*N) output channels, depthwise-group.
+      4. S_t = Ā ⊙ S_{t-1} + B_bar_t · x_t  (per spatial position, per channel)
+         via jax.lax.associative_scan — same operator as ConvSSMCSSM.
+      5. y_t = 2 · Re(S_t · C_bar_t).sum(N axis).
+      6. Output projection Dense(C).
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    state_dim: int = 16
+    kernel_size: int = 3
+    num_groups: int = 1
+    # Unused CSSM interface kwargs.
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B_b, T, H, W, C = x.shape
+        x_in = x
+        ks = self.kernel_size
+        N = self.state_dim
+
+        # === 1. Diagonal complex poles Λ (shared across channels, N state comps). ===
+        a_log = self.param('a_log', nn.initializers.constant(jnp.log(0.5)), (N,))
+        a_imag = self.param(
+            'a_imag',
+            lambda k, s: jax.random.uniform(k, s, minval=0.0, maxval=2.0 * jnp.pi),
+            (N,),
+        )
+        Lambda = (-jnp.exp(a_log.astype(jnp.float32))
+                  + 1j * a_imag.astype(jnp.float32)).astype(jnp.complex64)    # (N,)
+
+        # === 2. Per-channel log step size; ZOH discretization Ā = exp(Δ Λ). ===
+        log_Delta = self.param(
+            'log_Delta',
+            lambda k, s: jax.random.uniform(
+                k, s, minval=jnp.log(1e-3), maxval=jnp.log(1e-1)),
+            (C,),
+        )
+        Delta = jnp.exp(log_Delta.astype(jnp.float32))                        # (C,)
+        A_bar = jnp.exp(Delta[:, None].astype(jnp.complex64) * Lambda[None, :])  # (C, N)
+
+        # === 3. Conv-parameterized B and C (depthwise-group: each C input channel
+        #       produces N state components independently). ===
+        xf4 = x.reshape(B_b * T, H, W, C)
+        B_conv = nn.Conv(
+            features=C * N, kernel_size=(ks, ks),
+            feature_group_count=C, padding='SAME', name='B_conv',
+        )(xf4)                                                                # (B*T, H, W, C*N)
+        C_conv = nn.Conv(
+            features=C * N, kernel_size=(ks, ks),
+            feature_group_count=C, padding='SAME', name='C_conv',
+        )(xf4)
+        Bx = B_conv.reshape(B_b, T, H, W, C, N).astype(jnp.complex64)         # scan input
+        Cy = C_conv.reshape(B_b, T, H, W, C, N).astype(jnp.complex64)         # output mix
+
+        # === 4. Associative scan along T. ===
+        # A_bar broadcast to (B, T, H, W, C, N). Same pole every (b, h, w, c, n) —
+        # only T-axis accumulates state.
+        A_bT = jnp.broadcast_to(
+            A_bar[None, None, None, None, :, :], Bx.shape,
+        ).astype(jnp.complex64)
+
+        # Flatten (H, W) into the channel axis so the scan key is (B, T, HWCN).
+        # Actually direct_scalar_scan_op operates element-wise on arrays;
+        # axis=1 is the T axis, everything else is treated per-element.
+        _, hidden = jax.lax.associative_scan(
+            direct_scalar_scan_op,
+            (A_bT, Bx),
+            axis=1,
+        )  # hidden: (B, T, H, W, C, N) complex
+
+        # === 5. Readout: y = 2 * Re(hidden · C_bar).sum(-1). ===
+        y_cplx = (hidden * Cy).sum(axis=-1)                                   # (B, T, H, W, C) cplx
+        y = (2.0 * jnp.real(y_cplx)).astype(x.dtype)
+
+        # === 6. Output projection. ===
+        y = nn.Dense(C, name='out_proj')(y.reshape(B_b * T, H, W, C))
+        y = y.reshape(B_b, T, H, W, C)
+        return y - x_in
+
+
 class NoFFTCSSM(nn.Module):
     """Mamba-style SSM with NO FFT — operates entirely in pixel domain.
 
@@ -5399,3 +6173,328 @@ class NoGateCSSM(nn.Module):
 
         output = nn.Dense(C, name='out_proj')(ssm_out.reshape(B * T, H, W, C))
         return output.reshape(B, T, H, W, C) - x
+
+
+class DirectConvParallelCSSM(nn.Module):
+    """Theory-validation timing variant: depthwise 2D conv + scalar SSM
+    + *explicit* length-T temporal conv (no FFT, no associative-scan trick).
+
+    Spatial mixing: real-valued depthwise 2D conv (no FFT).
+    Temporal recurrence S_t = a·S_{t-1} + y_t is unrolled into its impulse
+    response [a^0, a^1, ..., a^{T-1}] and applied as a causal Toeplitz matmul
+    along the time axis. The kernel literally has length T per channel and the
+    Toeplitz operator is materialized as a (T, T, C) tensor, so compute is
+    O(T²·B·H·W·C) and memory is O(T²·C + B·T·HW·C). Crashes (OOM) at moderate
+    T — that's the *point*: this is the cost FFT and associative-scan both
+    avoid, and the panel exists to demonstrate why those tricks matter.
+
+    Used by `benchmarks/bench_image_timing.py` Panel T (theory validation) to
+    represent the "Parallel CSSM" curve — meant to grow superlinearly relative
+    to fCSSM (FFT, O(T log T)) and crash at large T. Not for training.
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    kernel_size: int = 5
+    spectral_rho: float = 0.999
+    # Interface-compat fields (accepted but unused).
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        # 1. Depthwise spatial conv (real, kernel_size × kernel_size) on input.
+        x_flat = x.reshape(B * T, H, W, C)
+        y_flat = nn.Conv(C, kernel_size=(self.kernel_size, self.kernel_size),
+                         feature_group_count=C, padding='SAME',
+                         name='spatial_conv')(x_flat)
+        y = y_flat.reshape(B, T, H, W, C)
+
+        # 2. Per-channel scalar damping a ∈ (-rho, rho) for stability.
+        a_logit = self.param('a_logit', nn.initializers.zeros, (C,))
+        a = self.spectral_rho * jnp.tanh(a_logit)            # (C,)
+
+        # 3. Materialize the length-T impulse response and full Toeplitz
+        #    operator. Each row of K is the causal kernel at one output
+        #    position; the kernel grows linearly with T and the operator
+        #    quadratically — exactly what FFT lets us avoid.
+        t_idx = jnp.arange(T, dtype=jnp.float32)             # (T,)
+        impulse = a.astype(jnp.float32)[None, :] ** t_idx[:, None]   # (T, C)
+
+        diff = jnp.arange(T)[:, None] - jnp.arange(T)[None, :]       # (T, T)
+        causal = diff >= 0
+        K = jnp.where(
+            causal[..., None],
+            impulse[jnp.clip(diff, 0)],                       # (T, T, C)
+            0.0,
+        )
+
+        # S[b, t, h, w, c] = sum_{j<=t} K[t, j, c] * y[b, j, h, w, c]
+        S = jnp.einsum('tjc,bjhwc->bthwc', K, y).astype(y.dtype)
+
+        # 4. Output projection.
+        output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x_in
+
+
+class DirectConvSeqCSSM(nn.Module):
+    """Theory-validation timing variant: depthwise 2D conv + scalar SSM
+    + sequential temporal scan.
+
+    Identical to DirectConvParallelCSSM except the temporal scan uses
+    `jax.lax.scan` instead of `jax.lax.associative_scan`. This makes the
+    temporal recurrence O(T) sequential — the asymptotic baseline that a
+    parallel scan beats.
+
+    Used by `benchmarks/bench_image_timing.py` Panel A (theory validation) to
+    represent the "Direct CSSM (sequential)" curve. Not intended for training.
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    kernel_size: int = 5
+    spectral_rho: float = 0.999
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        x_flat = x.reshape(B * T, H, W, C)
+        y_flat = nn.Conv(C, kernel_size=(self.kernel_size, self.kernel_size),
+                         feature_group_count=C, padding='SAME',
+                         name='spatial_conv')(x_flat)
+        y = y_flat.reshape(B, T, H, W, C)
+
+        a_logit = self.param('a_logit', nn.initializers.zeros, (C,))
+        a = self.spectral_rho * jnp.tanh(a_logit)
+        a_bcast = a[None, None, None, :]  # broadcast over (B, H, W, C)
+
+        # Sequential scan along T: transpose to T-major, scan, transpose back.
+        y_t_first = y.transpose(1, 0, 2, 3, 4)
+        S_init = jnp.zeros_like(y_t_first[0])
+
+        def step(S_prev, y_t):
+            S_new = a_bcast * S_prev + y_t
+            return S_new, S_new
+
+        _, S_t_first = jax.lax.scan(step, S_init, y_t_first)
+        S = S_t_first.transpose(1, 0, 2, 3, 4)
+
+        output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x_in
+
+
+def _circ_dwconv2d_batched(x, k):
+    """Per-channel circular depthwise 2D conv in real space (no FFT).
+
+    x, k both shape (..., H, W, C). Each (B*T)-th sample carries its own
+    (H, W, C) kernel. Output: same shape as x.
+
+    Cost: O(N·H²·W²·C) per call where N = prod(batch). Used by the
+    real-space sCSSM variants where the kernel is the temporal damping
+    operator that gets composed across scan steps.
+    """
+    *batch, H, W, C = x.shape
+    Bf = int(np.prod(batch)) if batch else 1
+    x_flat = x.reshape(Bf, H, W, C)
+    k_flat = k.reshape(Bf, H, W, C)
+    # Wrap-pad x to (Bf, 2H-1, 2W-1, C) so VALID conv with (H, W) kernel
+    # produces (H, W) output that is the circular conv.
+    x_pad = jnp.pad(x_flat, ((0, 0), (H - 1, 0), (W - 1, 0), (0, 0)), mode='wrap')
+    x_pad = x_pad[:, :2 * H - 1, :2 * W - 1, :]
+
+    def _one(x_one, k_one):
+        out = jax.lax.conv_general_dilated(
+            x_one[None], k_one[..., None, :],
+            window_strides=(1, 1), padding='VALID',
+            dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
+            feature_group_count=C,
+        )
+        return out[0]
+
+    out_flat = jax.vmap(_one)(x_pad, k_flat)
+    return out_flat.reshape(*batch, H, W, C)
+
+
+class NoGateRealSpaceParallelCSSM(nn.Module):
+    """sCSSM-without-FFT: same K×K kernel, applied as temporal damping in
+    real space, parallel scan via associative_scan with kernel-conv combiner.
+
+    Recurrence: S_t = k ⊛ S_{t-1} + k ⊛ x_t, where k is depthwise (C, K, K)
+    and ⊛ is real-space circular depthwise convolution. The associative_scan
+    carry is (k_eff, b_eff); the combiner is
+        ((k_a, b_a), (k_b, b_b)) ↦ (k_b ⊛ k_a, k_b ⊛ b_a + b_b)
+    where ⊛ is depthwise conv in real space. Each combine call does 2
+    real-space convs at O(H²·W²·C) each — vs O(H·W·log HW) per step under
+    FFT — so the panel can demonstrate the per-step cost of avoiding FFT.
+
+    Kernel is padded to (C, H, W) at init so the carry has fixed shape
+    across scan rounds (the natural growing kernel saturates at image size
+    via circular wrap; semantically equivalent to letting it grow freely
+    once it exceeds H×W).
+    """
+    channels: int
+    kernel_size: int = 5
+    spectral_rho: float = 0.999
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+        ks = self.kernel_size
+
+        k_spatial = self.param('kernel', nn.initializers.normal(0.02),
+                               (C, ks, ks))
+        if ks > H or ks > W:
+            sh, sw = (ks - H) // 2, (ks - W) // 2
+            k_pad = k_spatial[:, sh:sh + H, sw:sw + W]
+        else:
+            ph, pw = (H - ks) // 2, (W - ks) // 2
+            pha, pwa = max(0, H - ks - ph), max(0, W - ks - pw)
+            k_pad = jnp.pad(k_spatial, ((0, 0), (ph, pha), (pw, pwa)),
+                            mode='constant')
+        # Stability: bound the per-channel L2 norm of the kernel so the
+        # repeated conv composition stays in a reasonable range.
+        norm = jnp.linalg.norm(k_pad.reshape(C, -1), axis=-1).reshape(C, 1, 1)
+        k_pad = k_pad * (self.spectral_rho / (norm + 1e-8))
+        k_hwc = k_pad.transpose(1, 2, 0)                            # (H, W, C)
+
+        # Apply k as spatial filter to each x_t to get U_t = k ⊛ x_t.
+        k_b = jnp.broadcast_to(k_hwc[None, None], (B, T, H, W, C))
+        U = _circ_dwconv2d_batched(x, k_b)                          # (B, T, H, W, C)
+
+        # Associative scan with kernel-conv combiner.
+        K_carry = jnp.broadcast_to(k_hwc[None, None], (B, T, H, W, C))
+
+        def combiner(left, right):
+            k_l, b_l = left
+            k_r, b_r = right
+            new_k = _circ_dwconv2d_batched(k_l, k_r)
+            new_b = _circ_dwconv2d_batched(b_l, k_r) + b_r
+            return (new_k, new_b)
+
+        _, S = jax.lax.associative_scan(combiner, (K_carry, U), axis=1)
+
+        output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x_in
+
+
+class NoGateRealSpaceSeqCSSM(nn.Module):
+    """sCSSM-without-FFT, sequential variant: same recurrence as
+    NoGateRealSpaceParallelCSSM but executed via `jax.lax.scan` — each step
+    applies the K×K kernel ⊛ to (S_{t-1} + x_t) in real space. T sequential
+    convs, no kernel composition (carry is just S_{t-1}, fixed shape).
+    """
+    channels: int
+    kernel_size: int = 5
+    spectral_rho: float = 0.999
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+        ks = self.kernel_size
+
+        k_spatial = self.param('kernel', nn.initializers.normal(0.02),
+                               (C, ks, ks))
+        if ks > H or ks > W:
+            sh, sw = (ks - H) // 2, (ks - W) // 2
+            k_pad = k_spatial[:, sh:sh + H, sw:sw + W]
+        else:
+            ph, pw = (H - ks) // 2, (W - ks) // 2
+            pha, pwa = max(0, H - ks - ph), max(0, W - ks - pw)
+            k_pad = jnp.pad(k_spatial, ((0, 0), (ph, pha), (pw, pwa)),
+                            mode='constant')
+        norm = jnp.linalg.norm(k_pad.reshape(C, -1), axis=-1).reshape(C, 1, 1)
+        k_pad = k_pad * (self.spectral_rho / (norm + 1e-8))
+        k_hwc = k_pad.transpose(1, 2, 0)                            # (H, W, C)
+
+        # Wrap-pad k_hwc into the per-step conv shape; we'll broadcast a
+        # fresh batch dim each step.
+        x_t_first = x.transpose(1, 0, 2, 3, 4)                      # (T, B, H, W, C)
+        S_init = jnp.zeros_like(x_t_first[0])
+
+        def step(S_prev, x_t):
+            # S_t = k ⊛ (S_{t-1} + x_t)
+            inp = S_prev + x_t                                      # (B, H, W, C)
+            k_bcast = jnp.broadcast_to(k_hwc[None], inp.shape)      # (B, H, W, C)
+            S_next = _circ_dwconv2d_batched(inp, k_bcast)
+            return S_next, S_next
+
+        _, S_t_first = jax.lax.scan(step, S_init, x_t_first)
+        S = S_t_first.transpose(1, 0, 2, 3, 4)                      # (B, T, H, W, C)
+
+        output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x_in
+
+
+class DirectConvAssocCSSM(nn.Module):
+    """Theory-validation timing variant: depthwise 2D conv + scalar SSM
+    + parallel temporal scan via associative_scan with scalar summary.
+
+    Same architecture as DirectConvParallelCSSM and DirectConvSeqCSSM
+    (real-space depthwise spatial conv + per-channel scalar damping a),
+    but the temporal recurrence S_t = a · S_{t-1} + y_t is computed via
+    `jax.lax.associative_scan`. The combiner closed-form keeps the carry
+    summary (a_eff, b_eff) at SCALAR shape per channel — never materializes
+    a length-T impulse response. O(T log T) FLOPs, no kernel growth.
+
+    Pairs with DirectConvParallelCSSM (Toeplitz materialization → grows)
+    and DirectConvSeqCSSM (sequential scan) for the apples-to-apples
+    "three temporal-scan algorithms, identical real-space spatial mixing"
+    comparison in benchmarks/bench_image_timing.py Panel T.
+
+    Returns delta for SimpleCSSM's external residual.
+    """
+    channels: int
+    kernel_size: int = 5
+    spectral_rho: float = 0.999
+    short_conv_size: int = 4
+    short_conv_spatial_size: int = 0
+    block_size: int = 1
+    rope_mode: str = 'none'
+
+    @nn.compact
+    def __call__(self, x, injected_qkv_spatial=None):
+        B, T, H, W, C = x.shape
+        x_in = x
+
+        x_flat = x.reshape(B * T, H, W, C)
+        y_flat = nn.Conv(C, kernel_size=(self.kernel_size, self.kernel_size),
+                         feature_group_count=C, padding='SAME',
+                         name='spatial_conv')(x_flat)
+        y = y_flat.reshape(B, T, H, W, C)
+
+        a_logit = self.param('a_logit', nn.initializers.zeros, (C,))
+        a = self.spectral_rho * jnp.tanh(a_logit)            # (C,)
+        a_b = jnp.broadcast_to(a[None, None, None, None, :], (B, T, H, W, C))
+
+        # Associative scalar scan: combiner closed-form keeps (a_eff, b_eff)
+        # at the same shape as a single scan element — no kernel materialization.
+        a_scan = a_b.reshape(B, T, H * W * C).astype(jnp.complex64)
+        y_scan = y.reshape(B, T, H * W * C).astype(jnp.complex64)
+        _, S_scan = jax.lax.associative_scan(
+            direct_scalar_scan_op, (a_scan, y_scan), axis=1
+        )
+        S = S_scan.real.reshape(B, T, H, W, C)
+
+        output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
+        return output.reshape(B, T, H, W, C) - x_in

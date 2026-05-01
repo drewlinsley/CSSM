@@ -9,8 +9,38 @@ Supports:
 Uses official optax implementations.
 """
 
+import jax
 import optax
-from typing import Callable
+from typing import Callable, Tuple
+
+
+def make_weight_decay_mask(params, excluded_names: Tuple[str, ...]):
+    """Return a same-shape boolean pytree: True where weight decay applies,
+    False under any subtree whose path includes a name in `excluded_names`.
+    """
+    def _walk(node, path):
+        if isinstance(node, dict):
+            return {k: _walk(v, path + (k,)) for k, v in node.items()}
+        # leaf
+        excluded = any(p in excluded_names for p in path)
+        return not excluded
+
+    return _walk(params, ())
+
+
+def make_param_labels(params, probe_names: Tuple[str, ...]):
+    """Return a same-shape pytree of string labels: 'probe' under any subtree
+    whose path includes a name in `probe_names`, 'backbone' elsewhere.
+
+    Used as the label function for optax.multi_transform when applying a
+    different (constant) LR to the linear probe head.
+    """
+    def _walk(node, path):
+        if isinstance(node, dict):
+            return {k: _walk(v, path + (k,)) for k, v in node.items()}
+        return 'probe' if any(p in probe_names for p in path) else 'backbone'
+
+    return _walk(params, ())
 
 
 def create_optimizer(
@@ -26,6 +56,9 @@ def create_optimizer(
     b1: float = 0.9,
     b2: float = 0.999,
     eps: float = 1e-6,
+    no_decay_names: Tuple[str, ...] = (),
+    probe_lr: float = None,
+    probe_names: Tuple[str, ...] = ('linear_probe_head',),
 ) -> optax.GradientTransformation:
     """
     Factory function to create optimizers with learning rate schedule.
@@ -68,17 +101,41 @@ def create_optimizer(
 
     if optimizer_name == 'adamw':
         # AdamW: Adam with decoupled weight decay
-        # Good default for most vision transformers
-        return optax.chain(
-            clip_fn,
-            optax.adamw(
-                learning_rate=schedule,
-                weight_decay=weight_decay,
-                b1=b1,
-                b2=b2,
-                eps=eps,
-            ),
+        # Good default for most vision transformers.
+        # If no_decay_names is provided, build a weight_decay mask that
+        # excludes those subtrees (used to keep classification heads from
+        # silently decaying to zero when they receive no gradient signal).
+        if no_decay_names:
+            wd_mask_fn = lambda params: make_weight_decay_mask(params, no_decay_names)
+        else:
+            wd_mask_fn = None
+
+        backbone_adamw = optax.adamw(
+            learning_rate=schedule,
+            weight_decay=weight_decay,
+            b1=b1, b2=b2, eps=eps,
+            mask=wd_mask_fn,
         )
+
+        if probe_lr is not None:
+            # Multi-transform: constant LR for the linear_probe_head (no warmup),
+            # standard cosine schedule for everything else. Both optimizers run
+            # under the same gradient clip applied first.
+            probe_adamw = optax.adamw(
+                learning_rate=probe_lr,
+                weight_decay=0.0,
+                b1=b1, b2=b2, eps=eps,
+            )
+            label_fn = lambda params: make_param_labels(params, probe_names)
+            return optax.chain(
+                clip_fn,
+                optax.multi_transform(
+                    {'backbone': backbone_adamw, 'probe': probe_adamw},
+                    param_labels=label_fn,
+                ),
+            )
+
+        return optax.chain(clip_fn, backbone_adamw)
 
     elif optimizer_name == 'lamb':
         # LAMB: Layer-wise Adaptive Moments for Batch training

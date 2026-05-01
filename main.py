@@ -614,7 +614,7 @@ def main():
 
     # CSSM configuration
     parser.add_argument('--cssm', type=str,
-                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm', 'no_fft', 'no_gate'],
+                        choices=['hgru_bi', 'transformer', 'mult_transformer', 'g_transformer', 'mg_transformer', 'spectral_transformer', 'gated', 'kqv', 'add_kqv', 'add_kqv_2', 'add_kqv_1', 'add_delta', 'deltanet', 'deltanet_d2', 'deltanet_d3', 'gdn', 'gdn_d2', 'gdn_d3', 'gdn_int', 'gdn_int_elem', 'gdn_int_qk', 'spatial_attn', 'spatiotemporal_attn', 'mamba2_seq', 'gdn_seq', 'conv_ssm', 's4nd', 's4nd_full', 'convs5', 'no_fft', 'no_gate'],
                         default='hgru_bi',
                         help='CSSM type: hgru_bi (primary), gated, kqv, transformer (additive), mult_transformer (multiplicative), g_transformer (growing attention), mg_transformer (mamba-style growing), spectral_transformer (correct spatial Q gating), add_kqv (3-state Q→K→V), add_kqv_2 (2-state Q→V), add_kqv_1 (1-state scalar scan), add_delta (delta-enhanced 3-state), deltanet (spectral DeltaNet), deltanet_d2 (matrix DeltaNet d_k=2), deltanet_d3 (matrix DeltaNet d_k=3), gdn (gated DeltaNet d_k=2), gdn_d2 (gated DeltaNet d_k=2), gdn_d3 (gated DeltaNet d_k=3)')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
@@ -725,6 +725,15 @@ def main():
     parser.add_argument('--flatten_mode', type=str, default='temporal_spatial',
                         choices=['temporal_spatial', 'per_frame'],
                         help='[mamba2_seq/gdn_seq] How to flatten 5D to 1D: temporal_spatial (T*H*W) or per_frame (H*W per frame)')
+    # S4NDCSSM / ConvS5CSSM config
+    parser.add_argument('--s4nd_d_state', type=int, default=64,
+                        help='[s4nd] S4ND per-axis state dim N (default: 64)')
+    parser.add_argument('--s4nd_bidirectional', action=argparse.BooleanOptionalAction, default=True,
+                        help='[s4nd] Use bidirectional flip-and-sum kernel. Disable with --no-s4nd_bidirectional.')
+    parser.add_argument('--convs5_state_dim', type=int, default=16,
+                        help='[convs5] Official ConvSSM/ConvS5 diagonal-complex state dim N (default: 16)')
+    parser.add_argument('--convs5_num_groups', type=int, default=1,
+                        help='[convs5] ConvS5 B/C conv group count (default 1 = depthwise-per-channel)')
     parser.add_argument('--label_smoothing', type=float, default=0.0,
                         help='Label smoothing epsilon (0=none, 0.1=typical)')
     parser.add_argument('--bn_train_mode', action='store_true',
@@ -1097,6 +1106,11 @@ def main():
             state_dim=args.state_dim,
             expand_factor=args.expand_factor,
             flatten_mode=args.flatten_mode,
+            # S4NDCSSM / ConvS5CSSM config
+            s4nd_d_state=args.s4nd_d_state,
+            s4nd_bidirectional=args.s4nd_bidirectional,
+            convs5_state_dim=args.convs5_state_dim,
+            convs5_num_groups=args.convs5_num_groups,
         )
     elif args.arch == 'vit':
         model = CSSMViT(

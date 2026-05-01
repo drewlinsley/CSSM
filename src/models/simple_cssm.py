@@ -15,7 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 
-from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, NoFFTCSSM, NoGateCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding
+from .cssm import (GatedCSSM, HGRUBilinearCSSM, TransformerCSSM, MultiplicativeTransformerCSSM, GrowingTransformerCSSM, MambaGrowingTransformerCSSM, SpectralTransformerCSSM, AdditiveCSSM, DeltaNetCSSM, MatrixDeltaNetCSSM, GatedDeltaNetCSSM, SpatialAttentionCSSM, Mamba2SeqCSSM, GDNSeqCSSM, ConvSSMCSSM, S4NDCSSM, S4NDFullCSSM, ConvS5CSSM, NoFFTCSSM, NoGateCSSM, DirectConvParallelCSSM, DirectConvSeqCSSM, DirectConvAssocCSSM,
+    NoGateRealSpaceParallelCSSM, NoGateRealSpaceSeqCSSM, apply_rope, apply_learned_temporal_encoding, apply_sinusoidal_temporal_encoding)
 
 
 # Registry of CSSM variants
@@ -45,9 +46,17 @@ CSSM_REGISTRY = {
     'spatiotemporal_attn': SpatialAttentionCSSM,  # Spatial + temporal attention
     'mamba2_seq': Mamba2SeqCSSM,              # Mamba-2 on flattened 1D tokens (no spatial)
     'gdn_seq': GDNSeqCSSM,                   # Gated DeltaNet on flattened 1D tokens (no spatial)
-    'conv_ssm': ConvSSMCSSM,                  # ConvSSM: spatial conv + temporal scan (NVlabs)
+    'conv_ssm': ConvSSMCSSM,                  # ConvSSM: spatial conv + temporal scan (NVlabs, simplified scalar)
+    's4nd': S4NDCSSM,                         # S4ND: separable per-axis S4 (2D, spatial-only) — S4D-diagonal
+    's4nd_full': S4NDFullCSSM,                # True S4ND: HiPPO-LegS DPLR per-axis (Nguyen 2022, full canonical)
+    'convs5': ConvS5CSSM,                     # Official ConvS5 (NVlabs): diagonal complex SSM + conv B/C + associative scan
     'no_fft': NoFFTCSSM,                      # No-FFT Mamba: pixel-domain scalar scan, no spectral transform
     'no_gate': NoGateCSSM,                    # No-gate spectral CSSM: FFT + kernel only, no B/C/Delta gates
+    'direct_conv_parallel': DirectConvParallelCSSM,  # Theory benchmark: depthwise conv + scalar SSM, Toeplitz materialization (kernel grows)
+    'direct_conv_seq': DirectConvSeqCSSM,            # Theory benchmark: depthwise conv + scalar SSM, sequential scan
+    'direct_conv_assoc': DirectConvAssocCSSM,        # Theory benchmark: depthwise conv + scalar SSM, associative_scan (no growth)
+    'no_gate_realspace_par': NoGateRealSpaceParallelCSSM,  # Theory: sCSSM-without-FFT, real-space conv + associative_scan w/ kernel-conv combiner
+    'no_gate_realspace_seq': NoGateRealSpaceSeqCSSM,       # Theory: sCSSM-without-FFT, real-space conv + sequential lax.scan w/ kernel-conv damping
 }
 
 
@@ -143,6 +152,11 @@ class SimpleCSSM(nn.Module):
     state_dim: int = 16                # SSM state dimension N
     expand_factor: int = 2             # Inner dimension expansion factor
     flatten_mode: str = 'temporal_spatial'  # 'temporal_spatial' or 'per_frame'
+    # S4NDCSSM (s4nd) and ConvS5CSSM (convs5) config
+    s4nd_d_state: int = 64             # S4ND per-axis state dim N
+    s4nd_bidirectional: bool = True    # S4ND use flip-and-sum bidirectional kernel
+    convs5_state_dim: int = 16         # ConvS5 diagonal-complex state dim N
+    convs5_num_groups: int = 1         # ConvS5 conv group count (1 = depthwise-per-channel)
 
     def _get_act(self):
         """Get activation function."""
@@ -331,6 +345,12 @@ class SimpleCSSM(nn.Module):
             if self.cssm_type == 'no_gate':
                 cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
                 cssm_kwargs['short_conv_size'] = self.short_conv_size
+            # Theory-validation benchmark variants — share NoGateCSSM's
+            # interface, accept the same fields.
+            if self.cssm_type in ('direct_conv_parallel', 'direct_conv_seq', 'direct_conv_assoc',
+                                  'no_gate_realspace_par', 'no_gate_realspace_seq'):
+                cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
+                cssm_kwargs['short_conv_size'] = self.short_conv_size
             # position_independent_gates applies to transformer variants
             if self.cssm_type in ['transformer', 'mult_transformer', 'g_transformer', 'mg_transformer'] and self.position_independent_gates:
                 cssm_kwargs['position_independent_gates'] = True
@@ -450,6 +470,14 @@ class SimpleCSSM(nn.Module):
             # ConvSSMCSSM config (kernel_size already passed by default)
             if self.cssm_type == 'conv_ssm':
                 pass  # kernel_size already in cssm_kwargs
+            # S4NDCSSM / S4NDFullCSSM config
+            if self.cssm_type in ('s4nd', 's4nd_full'):
+                cssm_kwargs['d_state'] = self.s4nd_d_state
+                cssm_kwargs['bidirectional'] = self.s4nd_bidirectional
+            # ConvS5CSSM config (kernel_size already passed by default)
+            if self.cssm_type == 'convs5':
+                cssm_kwargs['state_dim'] = self.convs5_state_dim
+                cssm_kwargs['num_groups'] = self.convs5_num_groups
             cssm = CSSMClass(**cssm_kwargs)
             x = x + cssm(x, injected_qkv_spatial=injected_qkv_spatial)  # Residual connection
 

@@ -37,6 +37,8 @@ class ConvBN(nn.Module):
     kernel_size: int = 3
     stride: int = 1
     padding: str = 'SAME'
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -46,11 +48,15 @@ class ConvBN(nn.Module):
             strides=(self.stride, self.stride),
             padding=self.padding,
             use_bias=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name='conv'
         )(x)
         x = nn.BatchNorm(
             use_running_average=deterministic,
             momentum=0.9,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name='bn'
         )(x)
         return x
@@ -60,23 +66,31 @@ class PatchEmbed(nn.Module):
     """Overlapping patch embedding with conv layers."""
     embed_dim: int
     patch_size: int = 4
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        # Two conv layers for overlapping patches
-        x = ConvBN(self.embed_dim // 2, kernel_size=3, stride=2)(x, deterministic)
+        # Cast float inputs to the compute dtype at the network entry.
+        x = x.astype(self.dtype)
+        x = ConvBN(self.embed_dim // 2, kernel_size=3, stride=2,
+                   dtype=self.dtype, param_dtype=self.param_dtype)(x, deterministic)
         x = jax.nn.gelu(x)
-        x = ConvBN(self.embed_dim, kernel_size=3, stride=2)(x, deterministic)
+        x = ConvBN(self.embed_dim, kernel_size=3, stride=2,
+                   dtype=self.dtype, param_dtype=self.param_dtype)(x, deterministic)
         return x
 
 
 class Downsample(nn.Module):
     """Spatial downsampling between stages."""
     out_dim: int
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        x = ConvBN(self.out_dim, kernel_size=3, stride=2)(x, deterministic)
+        x = ConvBN(self.out_dim, kernel_size=3, stride=2,
+                   dtype=self.dtype, param_dtype=self.param_dtype)(x, deterministic)
         return x
 
 
@@ -84,6 +98,8 @@ class DWConv(nn.Module):
     """Depthwise convolution for local mixing."""
     dim: int
     kernel_size: int = 3
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -93,6 +109,8 @@ class DWConv(nn.Module):
             kernel_size=(self.kernel_size, self.kernel_size),
             padding='SAME',
             feature_group_count=self.dim,  # Depthwise
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
             name='dwconv'
         )(x)
         return x
@@ -140,18 +158,26 @@ class Mlp(nn.Module):
     hidden_dim: int
     out_dim: int
     use_dwconv: bool = True
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         B, H, W, C = x.shape
 
-        x = nn.Dense(self.hidden_dim, name='fc1')(x)
+        x = nn.Dense(self.hidden_dim,
+                     dtype=self.dtype, param_dtype=self.param_dtype,
+                     name='fc1')(x)
         x = jax.nn.gelu(x)
 
         if self.use_dwconv:
-            x = x + DWConv(self.hidden_dim, name='dwconv')(x)
+            x = x + DWConv(self.hidden_dim,
+                           dtype=self.dtype, param_dtype=self.param_dtype,
+                           name='dwconv')(x)
 
-        x = nn.Dense(self.out_dim, name='fc2')(x)
+        x = nn.Dense(self.out_dim,
+                     dtype=self.dtype, param_dtype=self.param_dtype,
+                     name='fc2')(x)
 
         return x
 
@@ -200,25 +226,34 @@ class ConvBlock(nn.Module):
     dim: int
     mlp_ratio: float = 4.0
     drop_path: float = 0.0
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         # Conv path (replaces attention)
         residual = x
-        x = nn.LayerNorm(name='norm1')(x)
-        x = DWConv(self.dim, kernel_size=7, name='dwconv')(x)
+        x = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype,
+                         name='norm1')(x)
+        x = DWConv(self.dim, kernel_size=7,
+                   dtype=self.dtype, param_dtype=self.param_dtype,
+                   name='dwconv')(x)
         x = jax.nn.gelu(x)
-        x = nn.Dense(self.dim, name='pwconv')(x)
+        x = nn.Dense(self.dim,
+                     dtype=self.dtype, param_dtype=self.param_dtype,
+                     name='pwconv')(x)
         x = DropPath(self.drop_path)(x, deterministic)
         x = residual + x
 
         # MLP path
         residual = x
-        x = nn.LayerNorm(name='norm2')(x)
+        x = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype,
+                         name='norm2')(x)
         x = Mlp(
             hidden_dim=int(self.dim * self.mlp_ratio),
             out_dim=self.dim,
             use_dwconv=False,
+            dtype=self.dtype, param_dtype=self.param_dtype,
             name='mlp'
         )(x, deterministic)
         x = DropPath(self.drop_path)(x, deterministic)
