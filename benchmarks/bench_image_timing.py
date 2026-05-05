@@ -67,12 +67,13 @@ CHANNEL_SHADES = {
 PANEL_A = [
     # Family-grouped, dark → light within each family (matches the ordering
     # convention shared by `_plot_style.FAMILIES`).
-    'no_gate',       # Spectral SSM: sCSSM (light blue)
-    's4nd_full',     # Conv SSM: S4ND (light green) — moved here from Sequence SSM
-    'convs5',        # Conv SSM: ConvS5 (deep green)
-    'spatial_attn',  # Attention: Transformer (deep red)
-    'mamba2_seq',    # Sequence SSM: Mamba2 (darkest purple)
-    'gdn_seq',       # Sequence SSM: GDN (mid purple)
+    'no_gate',                  # Spectral SSM: sCSSM (light blue)
+    'no_gate_realspace_seq',    # Spatial CSSM family: real-space conv + lax.scan ("Sequential CSSM")
+    's4nd_full',                # Conv SSM: S4ND (light green) — moved here from Sequence SSM
+    'convs5',                   # Conv SSM: ConvS5 (deep green)
+    'spatial_attn',             # Attention: Transformer (deep red)
+    'mamba2_seq',               # Sequence SSM: Mamba2 (darkest purple)
+    'gdn_seq',                  # Sequence SSM: GDN (mid purple)
 ]
 PANEL_B = ['no_gate', 'gated', 'gdn']  # ungated, Mamba-style gated, DGM
 PANEL_C_FAMILY = 'gated'
@@ -107,7 +108,7 @@ THEORY_NAMES = {
     'no_gate_realspace_seq': 'CSSM (sequential)',
     'no_gate_realspace_par': 'CSSM (no FFT)',
     'direct_conv_assoc':     'CSSM (no space)',
-    'no_gate':               'sCSSM',
+    'no_gate':               'Spectral CSSM\n(sCSSM)',
 }
 
 
@@ -458,11 +459,19 @@ def _series_for_panel_a(rows):
     for cssm_type in PANEL_A:
         if cssm_type not in by_type:
             continue
-        name = CSSM_TYPE_TO_NAME[cssm_type]
+        # Theory variants (no_gate_realspace_*) live in THEORY_NAMES /
+        # THEORY_COLORS rather than the shared _plot_style palette. Fall
+        # back so they can be displayed in Panel A as baselines without
+        # polluting the global palette.
+        name = (CSSM_TYPE_TO_NAME.get(cssm_type)
+                or THEORY_NAMES.get(cssm_type))
+        color = COLORS.get(name) or THEORY_COLORS.get(cssm_type)
+        if name is None or color is None:
+            continue
         pts = _aggregate(by_type[cssm_type])
         oom_xs = _oom_xs_for(rows, 'A', cssm_type, 'T_video')
         if pts or oom_xs:
-            series.append((name, COLORS[name], pts, oom_xs))
+            series.append((name, color, pts, oom_xs))
     return series
 
 
@@ -556,9 +565,9 @@ def _add_slope_guides(ax, xs, var_name='N'):
     log_curve = np.where(log_curve <= 0, anchor, log_curve)
     lin = anchor * (xs / x0)
 
-    ax.plot(xs, log_curve, color='#888', linestyle=':', linewidth=1.4,
+    ax.plot(xs, log_curve, color='#888', linestyle=':', linewidth=2.2,
             alpha=0.55, zorder=1, label='_nolegend_', clip_on=True)
-    ax.plot(xs, lin, color='#888', linestyle='--', linewidth=1.4,
+    ax.plot(xs, lin, color='#888', linestyle='--', linewidth=2.2,
             alpha=0.55, zorder=1, label='_nolegend_', clip_on=True)
 
     ax.set_ylim(y_lo, y_hi)
@@ -568,9 +577,14 @@ def _add_slope_guides(ax, xs, var_name='N'):
         if not in_range.any():
             return
         i = int(np.where(in_range)[0][-1])
-        ax.text(xs[i] * 0.92, curve[i] * 1.15, txt,
-                fontsize=28, color='#555', alpha=0.85, ha='right',
-                va='bottom', zorder=2)
+        # Clamp label y so the *15% headroom* doesn't push the text off the
+        # top of the canvas when the final in-range curve point is already
+        # near y_hi (e.g. the linear O(T) guide).
+        y_top_cap = y_hi / (10 ** 0.06)  # ~13% margin from the top in log-space
+        y_lab = min(curve[i] * 1.15, y_top_cap)
+        ax.text(xs[i] * 0.92, y_lab, txt,
+                fontsize=38, color='#555', alpha=0.85, ha='right',
+                va='top', zorder=2, clip_on=True)
 
     _label(log_curve, rf'$\mathcal{{O}}(\log {var_name})$')
     _label(lin, rf'$\mathcal{{O}}({var_name})$')
@@ -607,9 +621,9 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
             if any(hi > lo for lo, hi in zip(los, his)):
                 ax.fill_between(xs, los, his, color=color, alpha=0.18,
                                 edgecolor='none', zorder=4)
-            ax.plot(xs, meds, marker='o', linestyle='-', linewidth=4.0,
-                    markersize=10, color=color, label=label, alpha=0.95,
-                    markeredgecolor='black', markeredgewidth=0.6, zorder=5,
+            ax.plot(xs, meds, marker='o', linestyle='-', linewidth=6.0,
+                    markersize=16, color=color, label=label, alpha=0.95,
+                    markeredgecolor='black', markeredgewidth=1.0, zorder=5,
                     solid_capstyle='round', solid_joinstyle='round')
             # Mark the last good point if any later T_video OOMed for this
             # series (the curve "dies" at that step).
@@ -627,12 +641,15 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
         ax.set_xlim(*xlim)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.set_xlabel(x_label, fontsize=40)
+    ax.set_xlabel(x_label, fontsize=52)
     if show_ylabel:
-        ax.set_ylabel('Step time (ms, fwd + bwd)', fontsize=40)
-    ax.set_title(title, fontsize=46, fontweight='bold', pad=24)
-    ax.tick_params(axis='both', which='major', labelsize=36)
-    ax.grid(which='both', linestyle=':', linewidth=0.5,
+        ax.set_ylabel('Step time (ms, fwd + bwd)', fontsize=52)
+    ax.set_title(title, fontsize=58, fontweight='bold', pad=30)
+    ax.tick_params(axis='both', which='major', labelsize=46, width=2.0, length=10)
+    ax.tick_params(axis='both', which='minor', width=1.5, length=6)
+    for spine in ax.spines.values():
+        spine.set_linewidth(2.0)
+    ax.grid(which='both', linestyle=':', linewidth=0.8,
             color='#cccccc', alpha=0.4)
     if has_data:
         # Slope guides need final y-range, so add them BEFORE legend (which
@@ -644,20 +661,22 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
             _add_attn_crossover(ax, attn_crossover_N,
                                 show_attn_labels=show_attn_labels,
                                 show_symbol_legend=show_symbol_legend)
-        ax.legend(loc='upper left', frameon=True, fancybox=False,
-                  borderpad=0.4, handletextpad=0.5, labelspacing=0.3,
-                  ncol=legend_ncol, columnspacing=0.8, fontsize=32)
+        # Top-left legend inside the panel.
+        ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98),
+                  frameon=False, ncol=1,
+                  borderpad=0.5, handletextpad=0.6, labelspacing=0.4,
+                  borderaxespad=0.0, fontsize=26)
     # Draw the OOM end-of-line marker (one per series): a large open circle
     # with × inside, placed at the last successful (x, y) on the curve so it
     # caps the line at the step before OOM.
     if oom_records:
         y_lo_now, y_hi_now = ax.get_ylim()
         for color, x_last, y_last in oom_records:
-            ax.scatter([x_last], [y_last], s=900, marker='o',
+            ax.scatter([x_last], [y_last], s=1300, marker='o',
                        facecolors='white', edgecolors=color,
-                       linewidths=4.0, zorder=12, clip_on=False)
-            ax.scatter([x_last], [y_last], s=350, marker='x',
-                       color=color, linewidths=5.0, zorder=13,
+                       linewidths=6.0, zorder=12, clip_on=False)
+            ax.scatter([x_last], [y_last], s=520, marker='x',
+                       color=color, linewidths=7.0, zorder=13,
                        clip_on=False)
         ax.set_ylim(y_lo_now, y_hi_now)
     sns.despine(ax=ax)
@@ -679,7 +698,7 @@ def _add_attn_crossover(ax, N_thresh, show_attn_labels=True,
     ax.axvspan(x_lo, N_thresh, color='#E8E8E8', alpha=0.7, zorder=0)
     # Right band stays white (no axvspan — keep default white background).
     # Threshold line.
-    ax.axvline(N_thresh, color='#888', linestyle='--', linewidth=0.8,
+    ax.axvline(N_thresh, color='#888', linestyle='--', linewidth=1.4,
                alpha=0.7, zorder=1)
 
     if show_attn_labels:
@@ -687,33 +706,33 @@ def _add_attn_crossover(ax, N_thresh, show_attn_labels=True,
         x_left = 10 ** (np.log10(x_lo) + 0.40 * (np.log10(N_thresh) - np.log10(x_lo)))
         x_right = 10 ** (np.log10(N_thresh) + 0.30 * (np.log10(x_hi) - np.log10(N_thresh)))
         ax.text(x_left, y_label, r'attn $\propto N\!\cdot\!C^{2}$',
-                fontsize=28, color='#424242', alpha=0.95,
+                fontsize=38, color='#424242', alpha=0.95,
                 ha='center', va='center', zorder=4,
                 bbox=dict(boxstyle='round,pad=0.18', facecolor='white',
-                          edgecolor='#616161', linewidth=0.4, alpha=0.9))
+                          edgecolor='#616161', linewidth=0.7, alpha=0.9))
         ax.text(x_right, y_label, r'attn $\propto N^{2}\!\cdot\!C$',
-                fontsize=28, color='#212121', alpha=0.95,
+                fontsize=38, color='#212121', alpha=0.95,
                 ha='center', va='center', zorder=4,
                 bbox=dict(boxstyle='round,pad=0.18', facecolor='white',
-                          edgecolor='#212121', linewidth=0.4, alpha=0.9))
+                          edgecolor='#212121', linewidth=0.7, alpha=0.9))
 
     # N = C threshold marker near the top.
     y_thresh_label = 10 ** (np.log10(y_lo) + 0.92 * (np.log10(y_hi) - np.log10(y_lo)))
     ax.text(N_thresh, y_thresh_label, r'$N=C$',
-            fontsize=28, color='#444', alpha=0.9,
+            fontsize=38, color='#444', alpha=0.9,
             ha='center', va='center', zorder=4,
             bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                      edgecolor='#888', linewidth=0.4, alpha=0.85))
+                      edgecolor='#888', linewidth=0.7, alpha=0.85))
 
     if show_symbol_legend:
         y_sym = 10 ** (np.log10(y_lo) + 0.05 * (np.log10(y_hi) - np.log10(y_lo)))
         x_sym = 10 ** (np.log10(x_lo) + 0.97 * (np.log10(x_hi) - np.log10(x_lo)))
         ax.text(x_sym, y_sym,
                 r'$N{=}H\!\cdot\!W$ tokens, $C{=}256$ ch.',
-                fontsize=24, color='#444', alpha=0.85,
+                fontsize=32, color='#444', alpha=0.85,
                 ha='right', va='bottom', zorder=4,
                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
-                          edgecolor='#bbb', linewidth=0.4, alpha=0.85))
+                          edgecolor='#bbb', linewidth=0.7, alpha=0.85))
     # Restore limits if axvspan/text nudged them.
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
@@ -751,7 +770,17 @@ def render_figure(rows, fig_path, hs, layout='main'):
     y_lo, y_hi = _global_y_range(rows)
     Ns = [h * h for h in hs]
     x_lo_N, x_hi_N = min(Ns) / 1.5, max(Ns) * 1.5
-    x_lo_T, x_hi_T = min(THEORY_TS) / 1.5, max(THEORY_TS) * 1.5
+    # Restrict the visible T range to what the data actually populates —
+    # without this we'd waste a full log decade on the right showing empty
+    # gridlines past T=1024 (the longest video any series reaches in the
+    # current sweeps before OOM).
+    actual_T = sorted({r['T_video'] for r in rows
+                       if r.get('panel') == 'T'
+                       and r.get('T_video') is not None})
+    if actual_T:
+        x_lo_T, x_hi_T = actual_T[0] / 1.5, actual_T[-1] * 1.5
+    else:
+        x_lo_T, x_hi_T = min(THEORY_TS) / 1.5, max(THEORY_TS) * 1.5
 
     if layout == 'width':
         # Appendix: width-scaling panel only — x = N (spatial tokens).
@@ -763,7 +792,7 @@ def render_figure(rows, fig_path, hs, layout='main'):
     else:
         # Main figure — all three panels share x = video length T at fixed
         # H=THEORY_H, C=THEORY_C, K=11.
-        fig, (axTheory, axB, axA) = plt.subplots(1, 3, figsize=(40, 13))
+        fig, (axTheory, axB, axA) = plt.subplots(1, 3, figsize=(46, 13))
         common_kw = dict(
             hs=THEORY_TS, x_label='Video length (T frames)',
             x_values=THEORY_TS, slope_var='T',
@@ -782,7 +811,7 @@ def render_figure(rows, fig_path, hs, layout='main'):
                     'Scalability Landscape',
                     show_ylabel=False, legend_ncol=2, **common_kw)
 
-    plt.subplots_adjust(left=0.06, right=0.99, bottom=0.14, top=0.90,
+    plt.subplots_adjust(left=0.05, right=0.99, bottom=0.14, top=0.90,
                         wspace=0.22)
 
     fig_path = os.path.abspath(fig_path)

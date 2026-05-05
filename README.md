@@ -168,7 +168,7 @@ CSSM/
 ```bibtex
 @article{scssm2026,
   title={Spectral State Space Models for Vision},
-  author={Linsley, Drew and others},
+  author={},
   year={2026}
 }
 ```
