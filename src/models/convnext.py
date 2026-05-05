@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn
 from typing import Type, Optional
 
-from .cssm import StandardCSSM, GatedOpponentCSSM
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM
 
 
 class DropPath(nn.Module):
@@ -256,10 +256,12 @@ class ModelFactory(nn.Module):
             Logits tensor of shape (B, num_classes)
         """
         # Select CSSM class based on config
-        if self.cssm_type == 'standard':
-            CSSM = StandardCSSM
-        else:
-            CSSM = GatedOpponentCSSM
+        if self.cssm_type == 'gated':
+            CSSM = GatedCSSM
+        elif self.cssm_type == 'transformer':
+            CSSM = TransformerCSSM
+        else:  # hgru_bi (default)
+            CSSM = HGRUBilinearCSSM
 
         dense = (self.mixing == 'dense')
 

@@ -1,0 +1,22 @@
+name: cssm
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - cudatoolkit=12.2
+  - cudnn=8.9
+  - pip:
+    - jax[cuda12_pip]>=0.4.20
+    - flax>=0.8.0
+    - optax>=0.1.7
+    - orbax-checkpoint>=0.5.0
+    - numpy>=1.24.0
+    - Pillow>=10.0.0
+    - wandb>=0.16.0
+    - tqdm>=4.65.0
+    - matplotlib>=3.7.0
+    - tensorflow>=2.15.0
+    - tensorflow-datasets>=4.9.0

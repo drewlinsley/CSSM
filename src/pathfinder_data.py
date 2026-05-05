@@ -12,11 +12,19 @@ The dataset has three difficulty levels based on contour length:
 
 For CSSM models that expect video input (B, T, H, W, C), we treat static
 images as single-frame "videos" with T=1, or optionally repeat frames.
+
+Supports:
+- Sequential loading (original)
+- Parallel loading with ThreadPoolExecutor (--num_workers > 0)
+- TFRecord format for maximum I/O performance
 """
 
 import os
 from pathlib import Path
 from typing import Tuple, Iterator, Optional
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+import threading
 
 import numpy as np
 from PIL import Image
@@ -189,12 +197,15 @@ class PathfinderVideoLoader:
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = True,
+        seed: int = 42,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.n_samples = len(dataset)
+        self._epoch = 0
+        self._seed = seed
 
     def __len__(self):
         if self.drop_last:
@@ -204,7 +215,9 @@ class PathfinderVideoLoader:
     def __iter__(self):
         indices = np.arange(self.n_samples)
         if self.shuffle:
-            np.random.shuffle(indices)
+            rng = np.random.RandomState(self._seed + self._epoch)
+            rng.shuffle(indices)
+            self._epoch += 1
 
         for start_idx in range(0, self.n_samples, self.batch_size):
             batch_indices = indices[start_idx:start_idx + self.batch_size]
@@ -226,6 +239,101 @@ class PathfinderVideoLoader:
             yield jnp.array(images), jnp.array(labels)
 
 
+class PathfinderVideoLoaderFast:
+    """
+    Fast parallel data loader for Pathfinder with prefetching.
+
+    Uses ThreadPoolExecutor to load batches in parallel and a prefetch
+    queue to overlap data loading with GPU compute.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        num_workers: int = 4,
+        prefetch_batches: int = 2,
+        seed: int = 42,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.num_workers = num_workers
+        self.prefetch_batches = prefetch_batches
+        self.n_samples = len(dataset)
+        self._epoch = 0
+        self._seed = seed
+
+    def __len__(self):
+        if self.drop_last:
+            return self.n_samples // self.batch_size
+        return (self.n_samples + self.batch_size - 1) // self.batch_size
+
+    def _load_single(self, idx: int) -> Tuple[np.ndarray, int]:
+        """Load a single sample (called by worker threads)."""
+        return self.dataset[idx]
+
+    def _load_batch(self, batch_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Load a batch of samples using thread pool."""
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            results = list(executor.map(self._load_single, batch_indices))
+
+        images = np.stack([r[0] for r in results], axis=0)
+        labels = np.array([r[1] for r in results], dtype=np.int32)
+        return images, labels
+
+    def _prefetch_worker(self, batch_indices_list: list, queue: Queue, stop_event: threading.Event):
+        """Background worker that prefetches batches into queue."""
+        for batch_indices in batch_indices_list:
+            if stop_event.is_set():
+                break
+            try:
+                images, labels = self._load_batch(batch_indices)
+                queue.put((jnp.array(images), jnp.array(labels)))
+            except Exception as e:
+                print(f"Prefetch error: {e}")
+                queue.put(None)
+        queue.put(None)  # Signal end of data
+
+    def __iter__(self):
+        indices = np.arange(self.n_samples)
+        if self.shuffle:
+            rng = np.random.RandomState(self._seed + self._epoch)
+            rng.shuffle(indices)
+            self._epoch += 1
+
+        # Create list of batch indices
+        batch_indices_list = []
+        for start_idx in range(0, self.n_samples, self.batch_size):
+            batch_indices = indices[start_idx:start_idx + self.batch_size]
+            if self.drop_last and len(batch_indices) < self.batch_size:
+                break
+            batch_indices_list.append(batch_indices)
+
+        # Start prefetch worker
+        queue = Queue(maxsize=self.prefetch_batches)
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=self._prefetch_worker,
+            args=(batch_indices_list, queue, stop_event)
+        )
+        worker.start()
+
+        # Yield batches from queue
+        try:
+            while True:
+                batch = queue.get()
+                if batch is None:
+                    break
+                yield batch
+        finally:
+            stop_event.set()
+            worker.join(timeout=1.0)
+
+
 def get_pathfinder_loader(
     root: str = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025',
     difficulty: str = '9',
@@ -237,7 +345,9 @@ def get_pathfinder_loader(
     val_ratio: float = 0.1,
     seed: int = 42,
     shuffle: bool = True,
-) -> PathfinderVideoLoader:
+    num_workers: int = 0,
+    prefetch_batches: int = 2,
+):
     """
     Get a batch iterator for Pathfinder dataset.
 
@@ -252,9 +362,11 @@ def get_pathfinder_loader(
         val_ratio: Val split ratio
         seed: Random seed
         shuffle: Whether to shuffle data
+        num_workers: Number of parallel workers (0=sequential, >0=parallel)
+        prefetch_batches: Number of batches to prefetch (only when num_workers>0)
 
     Returns:
-        PathfinderVideoLoader yielding (images, labels) tuples
+        PathfinderVideoLoader or PathfinderVideoLoaderFast yielding (images, labels)
         images: (B, T, H, W, 3) float32
         labels: (B,) int32
     """
@@ -277,21 +389,68 @@ def get_pathfinder_loader(
 
     print(f"  Loaded {len(dataset)} {split} samples")
 
-    return PathfinderVideoLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=True,
-    )
+    if num_workers > 0:
+        print(f"  Using parallel loader with {num_workers} workers, {prefetch_batches} prefetch batches")
+        return PathfinderVideoLoaderFast(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=True,
+            num_workers=num_workers,
+            prefetch_batches=prefetch_batches,
+        )
+    else:
+        return PathfinderVideoLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=True,
+        )
 
 
 def get_pathfinder_info(
     difficulty: str = '9',
     root: str = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025',
     train_ratio: float = 0.8,
+    tfrecord_dir: str = None,
 ) -> dict:
-    """Get dataset metadata."""
-    # Count actual images
+    """Get dataset metadata.
+
+    Args:
+        difficulty: Pathfinder difficulty level ('9', '14', '20')
+        root: Root directory for PNG files (used if tfrecord_dir is None)
+        train_ratio: Train split ratio (used if counting from PNGs)
+        tfrecord_dir: Path to TFRecord directory (reads metadata.json if available)
+
+    Returns:
+        Dictionary with dataset info including train_size
+    """
+    # Try to read from TFRecord metadata first
+    if tfrecord_dir is not None:
+        tfrecord_path = Path(tfrecord_dir)
+
+        # Try two possible locations for metadata.json:
+        # 1. User passed difficulty dir directly: tfrecord_dir/metadata.json
+        # 2. User passed parent dir: tfrecord_dir/difficulty_{difficulty}/metadata.json
+        metadata_path = tfrecord_path / 'metadata.json'
+        if not metadata_path.exists():
+            metadata_path = tfrecord_path / f'difficulty_{difficulty}' / 'metadata.json'
+
+        if metadata_path.exists():
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            return {
+                'num_classes': 2,
+                'train_size': metadata.get('train_samples', 0),
+                'total_size': metadata.get('total_samples', 0),
+                'image_size': metadata.get('image_size', 224),
+                'difficulty': metadata.get('difficulty', difficulty),
+                'task': 'binary_classification',
+                'description': f'Pathfinder contour length {difficulty} (TFRecord)',
+            }
+
+    # Fall back to counting actual images
     difficulty_dir = os.path.join(root, f'curv_contour_length_{difficulty}', 'imgs')
     n_pos = len(list(Path(difficulty_dir).glob('pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'pos')) else 0
     n_neg = len(list(Path(difficulty_dir).glob('neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'neg')) else 0
@@ -307,3 +466,211 @@ def get_pathfinder_info(
         'task': 'binary_classification',
         'description': f'Pathfinder contour length {difficulty}',
     }
+
+
+# =============================================================================
+# TFRecord-based loader for maximum I/O performance
+# =============================================================================
+
+try:
+    import tensorflow as tf
+    # IMPORTANT: Force TensorFlow to use CPU only to avoid NCCL conflicts with JAX
+    # This must be done before any TF operations
+    try:
+        tf.config.set_visible_devices([], 'GPU')
+    except RuntimeError:
+        pass  # Devices already initialized
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+
+
+class PathfinderTFRecordLoader:
+    """
+    Fast TFRecord-based data loader for Pathfinder.
+
+    Requires pre-conversion using scripts/convert_pathfinder_tfrecords.py
+
+    Supports two directory structures:
+    1. tfrecord_dir/difficulty_{difficulty}/{split}/*.tfrecord (parent dir)
+    2. tfrecord_dir/{split}/*.tfrecord (difficulty dir directly)
+    """
+
+    def __init__(
+        self,
+        tfrecord_dir: str,
+        difficulty: str,
+        split: str,
+        batch_size: int,
+        num_frames: int = 1,
+        shuffle: bool = True,
+        shuffle_buffer: int = 10000,
+        prefetch_batches: int = 2,
+        image_size: int = None,
+    ):
+        if not HAS_TF:
+            raise ImportError("TensorFlow required for TFRecord loading. Install with: pip install tensorflow")
+
+        self.batch_size = batch_size
+        self.num_frames = num_frames
+        self.shuffle = shuffle
+
+        tfrecord_path = Path(tfrecord_dir)
+
+        # Try two possible directory structures:
+        # 1. User passed parent dir: tfrecord_dir/difficulty_{difficulty}/{split}/
+        # 2. User passed difficulty dir directly: tfrecord_dir/{split}/
+        shard_dir = tfrecord_path / f'difficulty_{difficulty}' / split
+        metadata_path = tfrecord_path / f'difficulty_{difficulty}' / 'metadata.json'
+
+        if not shard_dir.exists():
+            # Try direct path (user passed difficulty dir)
+            shard_dir = tfrecord_path / split
+            metadata_path = tfrecord_path / 'metadata.json'
+
+        self.shard_paths = sorted(shard_dir.glob('*.tfrecord'))
+
+        if len(self.shard_paths) == 0:
+            raise ValueError(
+                f"No TFRecord shards found in {shard_dir}\n"
+                f"Expected structure: tfrecord_dir/{split}/*.tfrecord\n"
+                f"Or: tfrecord_dir/difficulty_{{difficulty}}/{split}/*.tfrecord"
+            )
+
+        # Load metadata for sample count and native image size
+        if metadata_path.exists():
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            self.n_samples = metadata.get(f'{split}_samples', 0)
+            self._native_size = metadata.get('image_size', 224)
+        else:
+            # Estimate from file count
+            self.n_samples = len(self.shard_paths) * 5000  # Rough estimate
+            self._native_size = 224
+
+        # image_size: output size after optional resize.  If None, use native.
+        self.image_size = image_size if image_size is not None else self._native_size
+        self._needs_resize = (self.image_size != self._native_size)
+
+        # Create TF dataset
+        self.dataset = self._create_dataset(shuffle_buffer, prefetch_batches)
+
+    def _parse_example(self, serialized):
+        """Parse a single TFRecord example."""
+        features = {
+            'image': tf.io.FixedLenFeature([], tf.string),
+            'label': tf.io.FixedLenFeature([], tf.int64),
+            'height': tf.io.FixedLenFeature([], tf.int64),
+            'width': tf.io.FixedLenFeature([], tf.int64),
+            'channels': tf.io.FixedLenFeature([], tf.int64),
+        }
+        example = tf.io.parse_single_example(serialized, features)
+
+        # Decode image at native (stored) resolution
+        image = tf.io.decode_raw(example['image'], tf.float32)
+        image = tf.reshape(image, [self._native_size, self._native_size, 3])
+
+        # Resize if a different output size was requested
+        if self._needs_resize:
+            image = tf.image.resize(image, [self.image_size, self.image_size],
+                                    method='bilinear')
+
+        label = tf.cast(example['label'], tf.int32)
+
+        return image, label
+
+    def _create_dataset(self, shuffle_buffer: int, prefetch_batches: int):
+        """Create optimized TF dataset pipeline."""
+        # Interleave shards for better I/O parallelism
+        files = tf.data.Dataset.from_tensor_slices([str(p) for p in self.shard_paths])
+
+        if self.shuffle:
+            files = files.shuffle(len(self.shard_paths))
+
+        # Use higher cycle_length for better I/O overlap
+        # TFRecordDataset with buffer_size for read-ahead
+        dataset = files.interleave(
+            lambda x: tf.data.TFRecordDataset(x, buffer_size=8 * 1024 * 1024),  # 8MB buffer
+            cycle_length=min(8, len(self.shard_paths)),  # More parallel reads
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,  # Allow out-of-order for speed
+        )
+
+        if self.shuffle:
+            dataset = dataset.shuffle(shuffle_buffer)
+
+        # Parse with parallel calls
+        dataset = dataset.map(
+            self._parse_example,
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,
+        )
+        dataset = dataset.batch(self.batch_size, drop_remainder=True)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Let TF decide prefetch size
+
+        return dataset
+
+    def __len__(self):
+        return self.n_samples // self.batch_size
+
+    def __iter__(self):
+        for images, labels in self.dataset:
+            # Convert to numpy and add temporal dimension
+            images_np = images.numpy()  # (B, H, W, 3)
+
+            # Repeat for temporal dimension: (B, H, W, 3) -> (B, T, H, W, 3)
+            images_video = np.stack([images_np] * self.num_frames, axis=1)
+
+            yield jnp.array(images_video), jnp.array(labels.numpy())
+
+
+def get_pathfinder_tfrecord_loader(
+    tfrecord_dir: str,
+    difficulty: str = '9',
+    batch_size: int = 32,
+    num_frames: int = 1,
+    split: str = 'train',
+    shuffle: bool = True,
+    shuffle_buffer: int = 10000,
+    prefetch_batches: int = 2,
+    image_size: int = None,
+):
+    """
+    Get TFRecord-based loader for Pathfinder.
+
+    Requires pre-conversion: python scripts/convert_pathfinder_to_tfrecord.py
+
+    Args:
+        tfrecord_dir: Directory containing TFRecord shards
+        difficulty: '9', '14', or '20'
+        batch_size: Batch size
+        num_frames: Number of frames for temporal dimension
+        split: 'train', 'val', or 'test'
+        shuffle: Whether to shuffle data
+        shuffle_buffer: Size of shuffle buffer
+        prefetch_batches: Number of batches to prefetch
+        image_size: Output image size. If None, uses native size from metadata.
+            If different from native, images are bilinear-resized in the pipeline.
+
+    Returns:
+        PathfinderTFRecordLoader yielding (images, labels)
+    """
+    loader = PathfinderTFRecordLoader(
+        tfrecord_dir=tfrecord_dir,
+        difficulty=difficulty,
+        split=split,
+        batch_size=batch_size,
+        num_frames=num_frames,
+        shuffle=shuffle,
+        shuffle_buffer=shuffle_buffer,
+        prefetch_batches=prefetch_batches,
+        image_size=image_size,
+    )
+
+    size_info = f"{loader.image_size}px"
+    if loader._needs_resize:
+        size_info += f" (resized from {loader._native_size}px)"
+    print(f"  TFRecord loader: {len(loader)} batches from {len(loader.shard_paths)} shards, {size_info}")
+
+    return loader
