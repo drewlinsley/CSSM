@@ -81,7 +81,7 @@ PANEL_C_DIMS = [64, 128, 256, 512, 1024]
 # Panel T (theory validation) — three CSSM variants timed against video
 # length T at fixed (H, C, K). Demonstrates the sequential / parallel /
 # spectral scaling regimes empirically.
-PANEL_THEORY = ['no_gate_realspace_seq', 'no_gate_realspace_par', 'direct_conv_assoc', 'no_gate']
+PANEL_THEORY = ['no_gate_realspace_par', 'no_gate_realspace_seq', 'no_gate']
 # Push T high enough for the sequential / parallel / spectral wall-clock
 # gaps to actually become visible. At H=32 C=256 the per-step spatial conv
 # dominates and the scan-structure differences wash out; at H=16 C=256 the
@@ -94,19 +94,16 @@ THEORY_C = 256       # fixed channels (matches Panel B default → exact overlap
 THEORY_K = 11        # fixed kernel size (matches Panel B default → exact overlap)
 
 THEORY_COLORS = {
-    # All three non-sCSSM variants avoid FFT (real-space convs throughout).
-    # Use a grey gradient so sCSSM is the only saturated colour — visually
-    # encodes "FFT trick wins; everything else falls back to a baseline".
-    # Lightest → darkest mirrors fastest → slowest.
-    'direct_conv_assoc':     '#D0D0D0',          # very light grey — 1×1 conv, scalar a (closest to sCSSM)
-    'no_gate_realspace_seq': '#909090',          # mid grey — kernel-conv damping, sequential
-    'no_gate_realspace_par': '#000000',          # black — kernel-conv damping, real-space parallel (worst)
-    'no_gate':               COLORS['sCSSM'],    # canonical sCSSM blue (the FFT winner)
+    # Two non-FFT variants in greys (Spatial = no-FFT parallel = worst,
+    # Sequential = K×K real-space sequential = middle); Spectral CSSM is
+    # the only saturated colour — the FFT winner.
+    'no_gate_realspace_par': '#000000',          # black — real-space conv + parallel scan (no FFT, worst)
+    'no_gate_realspace_seq': '#909090',          # mid grey — real-space K×K conv + sequential scan
+    'no_gate':               COLORS['sCSSM'],    # canonical Spectral CSSM blue
 }
 THEORY_NAMES = {
-    'no_gate_realspace_seq': 'CSSM (sequential)',
-    'no_gate_realspace_par': 'CSSM (no FFT)',
-    'direct_conv_assoc':     'CSSM (no space)',
+    'no_gate_realspace_par': 'Spatial CSSM',
+    'no_gate_realspace_seq': 'Sequential CSSM',
     'no_gate':               'sCSSM',
 }
 
@@ -569,7 +566,7 @@ def _add_slope_guides(ax, xs, var_name='N'):
             return
         i = int(np.where(in_range)[0][-1])
         ax.text(xs[i] * 0.92, curve[i] * 1.15, txt,
-                fontsize=28, color='#555', alpha=0.85, ha='right',
+                fontsize=40, color='#555', alpha=0.85, ha='right',
                 va='bottom', zorder=2)
 
     _label(log_curve, rf'$\mathcal{{O}}(\log {var_name})$')
@@ -589,6 +586,16 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
     """
     import seaborn as sns
     has_data = False
+    # Sort series slowest → fastest by average fwd+bwd runtime so the legend
+    # reads top-to-bottom in the same visual order the curves stack on the
+    # right edge of the panel. Series with no data sink to the bottom.
+    def _avg_runtime(entry):
+        pts = entry[2]
+        if not pts:
+            return -1.0  # below everything → ends up at bottom
+        return float(np.mean([p[1] for p in pts]))
+    series = sorted(series, key=_avg_runtime, reverse=True)
+
     # One OOM marker per series, placed at the last valid (x, y) on the
     # curve — i.e. the rightmost step before it ran out of memory.
     oom_records = []  # list of (color, x_last, y_last)
@@ -607,9 +614,9 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
             if any(hi > lo for lo, hi in zip(los, his)):
                 ax.fill_between(xs, los, his, color=color, alpha=0.18,
                                 edgecolor='none', zorder=4)
-            ax.plot(xs, meds, marker='o', linestyle='-', linewidth=4.0,
-                    markersize=10, color=color, label=label, alpha=0.95,
-                    markeredgecolor='black', markeredgewidth=0.6, zorder=5,
+            ax.plot(xs, meds, marker='o', linestyle='-', linewidth=6.5,
+                    markersize=18, color=color, label=label, alpha=0.95,
+                    markeredgecolor='black', markeredgewidth=0.8, zorder=5,
                     solid_capstyle='round', solid_joinstyle='round')
             # Mark the last good point if any later T_video OOMed for this
             # series (the curve "dies" at that step).
@@ -645,19 +652,19 @@ def _draw_panel(ax, series, title, hs, show_ylabel, legend_ncol=1,
                                 show_attn_labels=show_attn_labels,
                                 show_symbol_legend=show_symbol_legend)
         ax.legend(loc='upper left', frameon=True, fancybox=False,
-                  borderpad=0.4, handletextpad=0.5, labelspacing=0.3,
-                  ncol=legend_ncol, columnspacing=0.8, fontsize=32)
+                  borderpad=0.5, handletextpad=0.6, labelspacing=0.35,
+                  ncol=legend_ncol, columnspacing=0.8, fontsize=42)
     # Draw the OOM end-of-line marker (one per series): a large open circle
     # with × inside, placed at the last successful (x, y) on the curve so it
     # caps the line at the step before OOM.
     if oom_records:
         y_lo_now, y_hi_now = ax.get_ylim()
         for color, x_last, y_last in oom_records:
-            ax.scatter([x_last], [y_last], s=900, marker='o',
+            ax.scatter([x_last], [y_last], s=1500, marker='o',
                        facecolors='white', edgecolors=color,
-                       linewidths=4.0, zorder=12, clip_on=False)
-            ax.scatter([x_last], [y_last], s=350, marker='x',
-                       color=color, linewidths=5.0, zorder=13,
+                       linewidths=5.5, zorder=12, clip_on=False)
+            ax.scatter([x_last], [y_last], s=600, marker='x',
+                       color=color, linewidths=6.5, zorder=13,
                        clip_on=False)
         ax.set_ylim(y_lo_now, y_hi_now)
     sns.despine(ax=ax)

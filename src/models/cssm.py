@@ -6297,51 +6297,115 @@ class DirectConvSeqCSSM(nn.Module):
 def _circ_dwconv2d_batched(x, k):
     """Per-channel circular depthwise 2D conv in real space (no FFT).
 
-    x, k both shape (..., H, W, C). Each (B*T)-th sample carries its own
-    (H, W, C) kernel. Output: same shape as x.
+    Supports an arbitrary kernel shape (Kh, Kw) — does NOT force k to (H, W).
+    Merges the (B*T) batch dim into channel groups so the whole call is one
+    fused `lax.conv_general_dilated`, which is dramatically cheaper than
+    vmap'ing per-sample convs.
 
-    Cost: O(N·H²·W²·C) per call where N = prod(batch). Used by the
-    real-space sCSSM variants where the kernel is the temporal damping
-    operator that gets composed across scan steps.
+    x: (..., H, W, C);   k: (..., Kh, Kw, C)
+    Output: same shape as x.   Cost: O(N · H · W · Kh · Kw · C).
     """
     *batch, H, W, C = x.shape
+    Kh, Kw = k.shape[-3:-1]
     Bf = int(np.prod(batch)) if batch else 1
-    x_flat = x.reshape(Bf, H, W, C)
-    k_flat = k.reshape(Bf, H, W, C)
-    # Wrap-pad x to (Bf, 2H-1, 2W-1, C) so VALID conv with (H, W) kernel
-    # produces (H, W) output that is the circular conv.
-    x_pad = jnp.pad(x_flat, ((0, 0), (H - 1, 0), (W - 1, 0), (0, 0)), mode='wrap')
-    x_pad = x_pad[:, :2 * H - 1, :2 * W - 1, :]
+    if Bf == 0:                     # empty slice (associative_scan boundary)
+        return x
+    x = x.reshape(Bf, H, W, C)
+    k = k.reshape(Bf, Kh, Kw, C)
 
-    def _one(x_one, k_one):
-        out = jax.lax.conv_general_dilated(
-            x_one[None], k_one[..., None, :],
-            window_strides=(1, 1), padding='VALID',
-            dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-            feature_group_count=C,
-        )
-        return out[0]
+    pad_h = Kh - 1
+    pad_w = Kw - 1
+    x_pad = jnp.pad(
+        x,
+        ((0, 0), (pad_h // 2, pad_h - pad_h // 2),
+         (pad_w // 2, pad_w - pad_w // 2), (0, 0)),
+        mode='wrap',
+    )
 
-    out_flat = jax.vmap(_one)(x_pad, k_flat)
-    return out_flat.reshape(*batch, H, W, C)
+    # Merge batch into channel groups → single fused conv.
+    x_pad = x_pad.transpose(0, 3, 1, 2).reshape(1, Bf * C, H + pad_h, W + pad_w)
+    k = k.transpose(0, 3, 1, 2).reshape(Bf * C, 1, Kh, Kw)
+
+    out = jax.lax.conv_general_dilated(
+        x_pad, k,
+        window_strides=(1, 1), padding='VALID',
+        dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+        feature_group_count=Bf * C,
+    )
+    out = out.reshape(Bf, C, H, W).transpose(0, 2, 3, 1)
+    return out.reshape(*batch, H, W, C)
+
+
+def _linear_dwconv2d_kernel(k_l, k_r):
+    """Standard depthwise full convolution between two kernel tensors.
+
+    k_l: (..., Kh_l, Kw_l, C);   k_r: (..., Kh_r, Kw_r, C)
+    Returns: (..., Kh_l + Kh_r - 1, Kw_l + Kw_r - 1, C) — kernel grows.
+    """
+    *batch, Kh_l, Kw_l, C = k_l.shape
+    Kh_r, Kw_r = k_r.shape[-3:-1]
+    Bf = int(np.prod(batch)) if batch else 1
+    Kh_new = Kh_l + Kh_r - 1
+    Kw_new = Kw_l + Kw_r - 1
+    if Bf == 0:                     # empty slice (associative_scan boundary)
+        return jnp.zeros((*batch, Kh_new, Kw_new, C), dtype=k_l.dtype)
+    k_l = k_l.reshape(Bf, Kh_l, Kw_l, C)
+    k_r = k_r.reshape(Bf, Kh_r, Kw_r, C)
+    k_l = k_l.transpose(0, 3, 1, 2).reshape(1, Bf * C, Kh_l, Kw_l)
+    k_r = k_r.transpose(0, 3, 1, 2).reshape(Bf * C, 1, Kh_r, Kw_r)
+    # 'FULL' equivalent: pad lhs by (rhs_size - 1) on each side then VALID.
+    out = jax.lax.conv_general_dilated(
+        k_l, k_r,
+        window_strides=(1, 1),
+        padding=((Kh_r - 1, Kh_r - 1), (Kw_r - 1, Kw_r - 1)),
+        dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+        feature_group_count=Bf * C,
+    )
+    Kh_new = Kh_l + Kh_r - 1
+    Kw_new = Kw_l + Kw_r - 1
+    out = out.reshape(Bf, C, Kh_new, Kw_new).transpose(0, 2, 3, 1)
+    return out.reshape(*batch, Kh_new, Kw_new, C)
+
+
+def _center_crop_to_hw(k, H, W):
+    *batch, Kh, Kw, C = k.shape
+    sh = max(0, (Kh - H) // 2)
+    sw = max(0, (Kw - W) // 2)
+    return k[..., sh:sh + H, sw:sw + W, :]
+
+
+def _circ_block_conv(k_l, k_r, H, W):
+    """Kernel composition with natural growth + saturation at (H, W).
+
+    Used in the parallel kernel-conv combiner: each level of the
+    associative scan composes two interval kernels via `_linear_dwconv2d_kernel`
+    and crops to image size only once the result exceeds (H, W).
+    """
+    *_, Kh_l, Kw_l, _ = k_l.shape
+    Kh_r, Kw_r = k_r.shape[-3:-1]
+    Kh_new = Kh_l + Kh_r - 1
+    Kw_new = Kw_l + Kw_r - 1
+    k_full = _linear_dwconv2d_kernel(k_l, k_r)
+    if Kh_new <= H and Kw_new <= W:
+        return k_full
+    return _center_crop_to_hw(k_full, H, W)
 
 
 class NoGateRealSpaceParallelCSSM(nn.Module):
-    """sCSSM-without-FFT: same K×K kernel, applied as temporal damping in
-    real space, parallel scan via associative_scan with kernel-conv combiner.
+    """sCSSM-without-FFT: same K×K kernel as sCSSM, applied as temporal
+    damping in real space, parallel scan via `associative_scan` with a
+    kernel-conv combiner.
 
-    Recurrence: S_t = k ⊛ S_{t-1} + k ⊛ x_t, where k is depthwise (C, K, K)
-    and ⊛ is real-space circular depthwise convolution. The associative_scan
-    carry is (k_eff, b_eff); the combiner is
-        ((k_a, b_a), (k_b, b_b)) ↦ (k_b ⊛ k_a, k_b ⊛ b_a + b_b)
-    where ⊛ is depthwise conv in real space. Each combine call does 2
-    real-space convs at O(H²·W²·C) each — vs O(H·W·log HW) per step under
-    FFT — so the panel can demonstrate the per-step cost of avoiding FFT.
+    Recurrence: S_t = k ⊛ S_{t-1} + k ⊛ x_t with k of shape (C, K, K) and
+    ⊛ a real-space circular depthwise convolution. Carry is (k_eff, b_eff);
+    combiner: ((k_a, b_a), (k_b, b_b)) → (k_b ⊛ k_a, k_b ⊛ b_a + b_b).
 
-    Kernel is padded to (C, H, W) at init so the carry has fixed shape
-    across scan rounds (the natural growing kernel saturates at image size
-    via circular wrap; semantically equivalent to letting it grow freely
-    once it exceeds H×W).
+    Kernel is zero-padded to (C, H, W) at init so the carry has fixed shape
+    across associative_scan rounds (JAX's associative_scan requires the
+    combiner output to match input shape — we cannot grow the carry size
+    between levels). Each combine then does two full-image-size circular
+    convs, demonstrating the cost of doing the sCSSM recurrence without
+    the FFT shortcut. Compute per combine: O(B·T_seg·H²·W²·C).
     """
     channels: int
     kernel_size: int = 5
@@ -6357,27 +6421,29 @@ class NoGateRealSpaceParallelCSSM(nn.Module):
         x_in = x
         ks = self.kernel_size
 
+        # Learn (C, K, K), zero-pad to (C, H, W) so the carry has a single
+        # static shape across all scan levels.
         k_spatial = self.param('kernel', nn.initializers.normal(0.02),
                                (C, ks, ks))
         if ks > H or ks > W:
-            sh, sw = (ks - H) // 2, (ks - W) // 2
+            sh = max(0, (ks - H) // 2)
+            sw = max(0, (ks - W) // 2)
             k_pad = k_spatial[:, sh:sh + H, sw:sw + W]
         else:
             ph, pw = (H - ks) // 2, (W - ks) // 2
             pha, pwa = max(0, H - ks - ph), max(0, W - ks - pw)
             k_pad = jnp.pad(k_spatial, ((0, 0), (ph, pha), (pw, pwa)),
                             mode='constant')
-        # Stability: bound the per-channel L2 norm of the kernel so the
-        # repeated conv composition stays in a reasonable range.
         norm = jnp.linalg.norm(k_pad.reshape(C, -1), axis=-1).reshape(C, 1, 1)
         k_pad = k_pad * (self.spectral_rho / (norm + 1e-8))
         k_hwc = k_pad.transpose(1, 2, 0)                            # (H, W, C)
 
-        # Apply k as spatial filter to each x_t to get U_t = k ⊛ x_t.
+        # U_t = k ⊛ x_t — one circular conv per timestep.
         k_b = jnp.broadcast_to(k_hwc[None, None], (B, T, H, W, C))
         U = _circ_dwconv2d_batched(x, k_b)                          # (B, T, H, W, C)
 
-        # Associative scan with kernel-conv combiner.
+        # Associative scan with kernel-conv combiner. Both k and b stay
+        # at (H, W) shape so the carry is uniform across levels.
         K_carry = jnp.broadcast_to(k_hwc[None, None], (B, T, H, W, C))
 
         def combiner(left, right):
@@ -6394,10 +6460,11 @@ class NoGateRealSpaceParallelCSSM(nn.Module):
 
 
 class NoGateRealSpaceSeqCSSM(nn.Module):
-    """sCSSM-without-FFT, sequential variant: same recurrence as
-    NoGateRealSpaceParallelCSSM but executed via `jax.lax.scan` — each step
-    applies the K×K kernel ⊛ to (S_{t-1} + x_t) in real space. T sequential
-    convs, no kernel composition (carry is just S_{t-1}, fixed shape).
+    """sCSSM-without-FFT, sequential variant: same recurrence
+    S_t = k ⊛ (S_{t-1} + x_t) where k is the natural K×K depthwise kernel
+    (NOT padded to image size), applied via real-space circular conv each
+    step. T sequential convs, no kernel composition. Per-step cost:
+    O(B · H · W · K² · C) — the fair sequential baseline.
     """
     channels: int
     kernel_size: int = 5
@@ -6416,31 +6483,26 @@ class NoGateRealSpaceSeqCSSM(nn.Module):
         k_spatial = self.param('kernel', nn.initializers.normal(0.02),
                                (C, ks, ks))
         if ks > H or ks > W:
-            sh, sw = (ks - H) // 2, (ks - W) // 2
-            k_pad = k_spatial[:, sh:sh + H, sw:sw + W]
+            sh = max(0, (ks - H) // 2)
+            sw = max(0, (ks - W) // 2)
+            k_eff = k_spatial[:, sh:sh + min(H, ks), sw:sw + min(W, ks)]
         else:
-            ph, pw = (H - ks) // 2, (W - ks) // 2
-            pha, pwa = max(0, H - ks - ph), max(0, W - ks - pw)
-            k_pad = jnp.pad(k_spatial, ((0, 0), (ph, pha), (pw, pwa)),
-                            mode='constant')
-        norm = jnp.linalg.norm(k_pad.reshape(C, -1), axis=-1).reshape(C, 1, 1)
-        k_pad = k_pad * (self.spectral_rho / (norm + 1e-8))
-        k_hwc = k_pad.transpose(1, 2, 0)                            # (H, W, C)
+            k_eff = k_spatial                          # keep K×K small kernel
+        norm = jnp.linalg.norm(k_eff.reshape(C, -1), axis=-1).reshape(C, 1, 1)
+        k_eff = k_eff * (self.spectral_rho / (norm + 1e-8))
+        k_hwc = k_eff.transpose(1, 2, 0)               # (Kh, Kw, C)
 
-        # Wrap-pad k_hwc into the per-step conv shape; we'll broadcast a
-        # fresh batch dim each step.
-        x_t_first = x.transpose(1, 0, 2, 3, 4)                      # (T, B, H, W, C)
+        x_t_first = x.transpose(1, 0, 2, 3, 4)         # (T, B, H, W, C)
         S_init = jnp.zeros_like(x_t_first[0])
 
         def step(S_prev, x_t):
-            # S_t = k ⊛ (S_{t-1} + x_t)
-            inp = S_prev + x_t                                      # (B, H, W, C)
-            k_bcast = jnp.broadcast_to(k_hwc[None], inp.shape)      # (B, H, W, C)
+            inp = S_prev + x_t                         # (B, H, W, C)
+            k_bcast = jnp.broadcast_to(k_hwc[None], (B,) + k_hwc.shape)
             S_next = _circ_dwconv2d_batched(inp, k_bcast)
             return S_next, S_next
 
         _, S_t_first = jax.lax.scan(step, S_init, x_t_first)
-        S = S_t_first.transpose(1, 0, 2, 3, 4)                      # (B, T, H, W, C)
+        S = S_t_first.transpose(1, 0, 2, 3, 4)         # (B, T, H, W, C)
 
         output = nn.Dense(C, name='out_proj')(S.reshape(B * T, H, W, C))
         return output.reshape(B, T, H, W, C) - x_in

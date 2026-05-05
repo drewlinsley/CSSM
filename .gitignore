@@ -133,3 +133,6 @@ temp/
 *.key
 credentials.json
 CLAUDE.md
+
+# SLURM job logs (large)
+*.out
