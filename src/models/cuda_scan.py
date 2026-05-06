@@ -14,18 +14,21 @@ Integration:
             -I$CUDA_HOME/include --compiler-options '-fPIC'
 
     2. Set scan_mode='cuda' in the CSSM model config.
+
+Requires JAX >= 0.7.0 (uses jax.ffi API).
 """
 
 import os
+import ctypes
 import struct
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
-from jax.extend import ffi as jax_ffi
+import jax.ffi
 
 # ============================================================================
-# Constants (must match ssm_common.h / the .cu file)
+# Constants (must match the .cu file)
 # ============================================================================
 CHUNK_SIZE = 1024
 
@@ -45,13 +48,17 @@ def _ensure_lib():
         raise RuntimeError(
             f"CUDA scan library not found at {_LIB_PATH}. "
             "Build it with:\n"
-            "  nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu "
-            "-I$CUDA_HOME/include --compiler-options '-fPIC'"
+            "  cd src/models/cuda && nvcc -shared -o libssm_scan.so "
+            "ssm_fwd_large_complex.cu -I$CUDA_HOME/include "
+            "--compiler-options '-fPIC'"
         )
-    jax_ffi.register_ffi_target(
+    # Load the .so and register the entry point for XLA custom call
+    lib = ctypes.cdll.LoadLibrary(_LIB_PATH)
+    jax.ffi.register_ffi_target(
         "cuda_scan_complex_fwd",
-        jax_ffi.pycapsule(jax_ffi.load_library(_LIB_PATH)),
-        platform="gpu",
+        jax.ffi.pycapsule(lib.cuda_scan_complex_fwd),
+        platform="CUDA",
+        api_version=0,
     )
     _lib_loaded = True
 
@@ -109,20 +116,19 @@ def _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im):
 
     opaque = _pack_descriptor(B_size, T, D, M, num_chunks, num_levels)
 
-    result = jax_ffi.ffi_call(
+    # JAX 0.7+ API: ffi_call returns a callable
+    # api_version=0 for legacy custom call (void **buffers, const char *opaque)
+    h_re, h_im = jax.ffi.ffi_call(
         "cuda_scan_complex_fwd",
-        # result_shape_dtypes (positional)
         (
             jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_re
             jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_im
         ),
-        # input arrays (positional, variadic)
-        A_re, A_im, U_re, U_im,
-        # opaque descriptor
-        opaque=opaque,
-    )
+        custom_call_api_version=0,
+        legacy_backend_config=opaque,
+    )(A_re, A_im, U_re, U_im)
 
-    return result
+    return h_re, h_im
 
 
 # ============================================================================
@@ -183,8 +189,7 @@ def cuda_real_scan(A: jnp.ndarray, U: jnp.ndarray) -> jnp.ndarray:
     CUDA-accelerated parallel scan for real-valued scalar SSM.
 
     Convenience wrapper: passes real data as complex with zero imaginary part,
-    returns real output. For maximum performance at large scale, a dedicated
-    real-valued kernel (ssm_fwd_large.cu) can be integrated separately.
+    returns real output.
 
     Args:
         A: float32 (B, T, ...) — per-timestep decay
