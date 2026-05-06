@@ -5,23 +5,22 @@ Replaces jax.lax.associative_scan for the recurrence h_t = A_t * h_{t-1} + U_t
 (complex-valued, per channel per frequency bin) with a fused multi-block
 Blelloch scan kernel written in CUDA.
 
-Uses the same split real/imaginary convention as linear_split_scalar_scan_op:
-complex64 inputs are split into (float32 real, float32 imag) pairs.
-
-Integration:
-    1. Build the shared library:
-       nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu \
-            -I$CUDA_HOME/include --compiler-options '-fPIC'
-
-    2. Set scan_mode='cuda' in the CSSM model config.
+Forward pass: CUDA kernel (Blelloch parallel scan)
+Backward pass: JAX-native associative_scan (reverse adjoint scan)
 
 Requires JAX >= 0.7.0 (uses jax.ffi API).
+
+Build:
+    cd src/models/cuda
+    nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu \
+         -I$CUDA_HOME/include --compiler-options '-fPIC'
 """
 
 import os
 import ctypes
 import struct
 from typing import Optional
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -52,7 +51,6 @@ def _ensure_lib():
             "ssm_fwd_large_complex.cu -I$CUDA_HOME/include "
             "--compiler-options '-fPIC'"
         )
-    # Load the .so and register the entry point for XLA custom call
     lib = ctypes.cdll.LoadLibrary(_LIB_PATH)
     jax.ffi.register_ffi_target(
         "cuda_scan_complex_fwd",
@@ -64,7 +62,7 @@ def _ensure_lib():
 
 
 # ============================================================================
-# Helper: compute scan geometry
+# Helpers
 # ============================================================================
 def _scan_geometry(T: int):
     """Compute M (next power-of-2 >= T), num_chunks, and num_levels."""
@@ -83,46 +81,33 @@ def _scan_geometry(T: int):
 
 
 def _pack_descriptor(B_size, T, D, M, num_chunks, num_levels):
-    """Pack scan parameters into an opaque byte string matching ScanDescriptor.
-
-    Must match the C struct layout:
-        struct ScanDescriptor {
-            long B_size, T, D, M, num_chunks;
-            int  num_levels;
-        };
-    """
-    # 'l' = long (8 bytes on 64-bit), 'i' = int (4 bytes)
+    """Pack scan parameters matching the C ScanDescriptor struct."""
     return struct.pack("llllli", B_size, T, D, M, num_chunks, num_levels)
 
 
-# ============================================================================
-# Low-level JAX custom call wrapper
-# ============================================================================
-def _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im):
-    """
-    Call the CUDA kernel via XLA custom call.
+def _scan_op(carry_i, carry_j):
+    """Associative operator for h_t = A_t * h_{t-1} + U_t in complex space."""
+    A_i, u_i = carry_i
+    A_j, u_j = carry_j
+    return A_j * A_i, A_j * u_i + u_j
 
-    Args:
-        A_re, A_im: (B, T, D) float32 — split complex decay
-        U_re, U_im: (B, T, D) float32 — split complex input
 
-    Returns:
-        h_re, h_im: (B, T, D) float32 — split complex output states
-    """
+# ============================================================================
+# Raw CUDA forward (no autodiff)
+# ============================================================================
+def _cuda_fwd_raw(A_re, A_im, U_re, U_im):
+    """Call the CUDA kernel. Inputs/outputs are split float32 (B, T, D)."""
     _ensure_lib()
 
     B_size, T, D = A_re.shape
     M, num_chunks, num_levels = _scan_geometry(T)
-
     opaque = _pack_descriptor(B_size, T, D, M, num_chunks, num_levels)
 
-    # JAX 0.7+ API: ffi_call returns a callable
-    # api_version=0 for legacy custom call (void **buffers, const char *opaque)
     h_re, h_im = jax.ffi.ffi_call(
         "cuda_scan_complex_fwd",
         (
-            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_re
-            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_im
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
         ),
         custom_call_api_version=1,
         legacy_backend_config=opaque,
@@ -132,64 +117,101 @@ def _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im):
 
 
 # ============================================================================
-# Public API
+# Differentiable public API
 # ============================================================================
-def cuda_complex_scan(A: jnp.ndarray, U: jnp.ndarray,
-                      h0: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+@jax.custom_vjp
+def cuda_complex_scan(A, U):
     """
     CUDA-accelerated parallel scan for complex scalar SSM.
 
-    Computes h_t = A_t * h_{t-1} + U_t for all t in parallel using the
-    Blelloch algorithm implemented in CUDA.
+    Computes h_t = A_t * h_{t-1} + U_t for all t in parallel.
 
     Args:
         A: complex64 (B, T, ...) — per-timestep decay
-        U: complex64 (B, T, ...) — per-timestep input (already gated by B_proj)
-        h0: optional complex64 (B, ...) — initial state (not yet supported,
-            use learned_init prepend trick if needed)
+        U: complex64 (B, T, ...) — per-timestep input
 
     Returns:
         h: complex64 (B, T, ...) — output states at all timesteps
     """
-    if h0 is not None:
-        raise NotImplementedError(
-            "Initial state h0 not yet supported in CUDA scan. "
-            "Use the learned_init prepend approach instead."
-        )
-
     orig_shape = A.shape
     B_dim, T = orig_shape[0], orig_shape[1]
-    spatial = orig_shape[2:]  # e.g. (C, H, W_freq)
+    spatial = orig_shape[2:]
 
-    # Flatten spatial dims: (B, T, C, H, W_freq) -> (B, T, D)
     D = 1
     for s in spatial:
         D *= s
     A_flat = A.reshape(B_dim, T, D)
     U_flat = U.reshape(B_dim, T, D)
 
-    # Split complex -> real/imag float32
     A_re = A_flat.real.astype(jnp.float32)
     A_im = A_flat.imag.astype(jnp.float32)
     U_re = U_flat.real.astype(jnp.float32)
     U_im = U_flat.imag.astype(jnp.float32)
 
-    # Call kernel
-    h_re, h_im = _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im)
+    h_re, h_im = _cuda_fwd_raw(A_re, A_im, U_re, U_im)
 
-    # Recombine to complex and unflatten
     h = (h_re + 1j * h_im).astype(jnp.complex64)
-    h = h.reshape(orig_shape)
-
-    return h
+    return h.reshape(orig_shape)
 
 
-def cuda_real_scan(A: jnp.ndarray, U: jnp.ndarray) -> jnp.ndarray:
+def _cuda_scan_fwd(A, U):
+    """Forward pass: run CUDA kernel, save residuals for backward."""
+    h = cuda_complex_scan(A, U)
+    return h, (A, h)
+
+
+def _cuda_scan_bwd(res, g):
+    """
+    Backward pass: reverse adjoint scan using JAX associative_scan.
+
+    The adjoint satisfies:
+        lambda[T-1] = g[T-1]
+        lambda[t]   = g[t] + conj(A[t+1]) * lambda[t+1]
+
+    This is itself a linear scan running in reverse, computed by:
+    flipping the sequence, scanning forward, then flipping back.
+
+    Gradients:
+        dU[t] = lambda[t]
+        dA[t] = lambda[t] * conj(h[t-1])    (with h[-1] = 0)
+    """
+    A, h = res
+
+    # Build shifted A: A_shift[t] = A[t+1], with identity padding at end
+    A_shift = jnp.concatenate(
+        [A[:, 1:], jnp.ones_like(A[:, :1])], axis=1
+    )
+
+    # Reverse scan: flip, scan forward, flip back
+    A_bwd = jnp.conj(A_shift)[:, ::-1]
+    g_rev = g[:, ::-1]
+
+    _, adjoint_rev = jax.lax.associative_scan(
+        _scan_op, (A_bwd, g_rev), axis=1
+    )
+    adjoint = adjoint_rev[:, ::-1]
+
+    # dL/dU = adjoint
+    dU = adjoint
+
+    # dL/dA[t] = adjoint[t] * conj(h[t-1]), with h[-1] = 0
+    h_prev = jnp.concatenate(
+        [jnp.zeros_like(h[:, :1]), h[:, :-1]], axis=1
+    )
+    dA = adjoint * jnp.conj(h_prev)
+
+    return dA, dU
+
+
+cuda_complex_scan.defvjp(_cuda_scan_fwd, _cuda_scan_bwd)
+
+
+# ============================================================================
+# Real-valued convenience wrapper
+# ============================================================================
+def cuda_real_scan(A, U):
     """
     CUDA-accelerated parallel scan for real-valued scalar SSM.
-
-    Convenience wrapper: passes real data as complex with zero imaginary part,
-    returns real output.
 
     Args:
         A: float32 (B, T, ...) — per-timestep decay
