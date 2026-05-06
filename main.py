@@ -144,7 +144,7 @@ class SimpleCheckpointer:
 from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
 from src.models.simple_cssm import SimpleCSSM
-from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
+# from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
 
 # =============================================================================
 # Configure TensorFlow to use CPU only BEFORE importing data loaders.
