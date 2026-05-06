@@ -677,7 +677,7 @@ def main():
     parser.add_argument('--use_ssd', action='store_true',
                         help='[add_kqv] Use SSD chunked scan (legacy, prefer --scan_mode ssd)')
     parser.add_argument('--scan_mode', type=str, default='associative',
-                        choices=['associative', 'ssd', 'quadratic', 'pallas'],
+                        choices=['associative', 'ssd', 'quadratic', 'pallas', 'cuda'],
                         help='[add_kqv] Scan algorithm: associative (log-space), ssd (chunked Mamba-2), quadratic (T×T attention form), pallas (fused GPU kernel)')
     parser.add_argument('--ssd_chunk_size', type=int, default=8,
                         help='[add_kqv] Chunk size for SSD / chunked quadratic scan (default: 8)')
