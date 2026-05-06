@@ -592,7 +592,6 @@ class GatedCSSM(nn.Module):
             X_hat = from_goom(X_log)
 
         # --- 9. Apply C projection and Inverse Transform ---
-        # X_hat = from_goom(X_log)
         X_hat_modulated = X_hat * C_proj
         ssm_out = jnp.fft.irfft2(X_hat_modulated, s=(H, W), axes=(3, 4))
         ssm_out = ssm_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
@@ -728,9 +727,8 @@ class GatedCSSM(nn.Module):
             )
             
             X_hat = from_goom(X_log)
-            
+
         # --- 9. Apply C gate ---
-        # X_hat = from_goom(X_log)
         X_hat_gated = X_hat * C_gate  # (B, T, C, H, W_freq)
 
         # --- 10. Low-rank channel mixing in frequency domain ---

@@ -11,28 +11,21 @@ complex64 inputs are split into (float32 real, float32 imag) pairs.
 Integration:
     1. Build the shared library:
        nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu \
-            -I$CONDA_PREFIX/lib/python3.10/site-packages/torch/include \
             -I$CUDA_HOME/include --compiler-options '-fPIC'
 
     2. Set scan_mode='cuda' in the CSSM model config.
-
-Reference: Blelloch (1990) prefix sum, same algorithm as the PyTorch
-V2_CUDA kernel but adapted for complex-valued JAX tensors.
 """
 
 import os
-import math
-import functools
+import struct
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
-from jax import core, dtypes
-from jax.interpreters import mlir, batching
 from jax.extend import ffi as jax_ffi
 
 # ============================================================================
-# Constants (must match ssm_common.h)
+# Constants (must match ssm_common.h / the .cu file)
 # ============================================================================
 CHUNK_SIZE = 1024
 
@@ -51,7 +44,9 @@ def _ensure_lib():
     if not os.path.exists(_LIB_PATH):
         raise RuntimeError(
             f"CUDA scan library not found at {_LIB_PATH}. "
-            "Build it with: nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu ..."
+            "Build it with:\n"
+            "  nvcc -shared -o libssm_scan.so ssm_fwd_large_complex.cu "
+            "-I$CUDA_HOME/include --compiler-options '-fPIC'"
         )
     jax_ffi.register_ffi_target(
         "cuda_scan_complex_fwd",
@@ -80,6 +75,19 @@ def _scan_geometry(T: int):
     return M, num_chunks, num_levels
 
 
+def _pack_descriptor(B_size, T, D, M, num_chunks, num_levels):
+    """Pack scan parameters into an opaque byte string matching ScanDescriptor.
+
+    Must match the C struct layout:
+        struct ScanDescriptor {
+            long B_size, T, D, M, num_chunks;
+            int  num_levels;
+        };
+    """
+    # 'l' = long (8 bytes on 64-bit), 'i' = int (4 bytes)
+    return struct.pack("llllli", B_size, T, D, M, num_chunks, num_levels)
+
+
 # ============================================================================
 # Low-level JAX custom call wrapper
 # ============================================================================
@@ -99,34 +107,19 @@ def _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im):
     B_size, T, D = A_re.shape
     M, num_chunks, num_levels = _scan_geometry(T)
 
-    # The kernel writes into Aseq/useq of shape (B, M, D), then we slice [:, :T, :]
-    # We pass M, num_chunks, num_levels as static operand attributes
+    opaque = _pack_descriptor(B_size, T, D, M, num_chunks, num_levels)
 
-    # Allocate aggregate buffers for each level
-    # Level 0: num_chunks_0 = ceil(M / CHUNK_SIZE)
-    # Level 1: num_chunks_1 = ceil(num_chunks_0 / CHUNK_SIZE)
-    # etc.
-    agg_shapes = []
-    n = M
-    for _ in range(num_levels):
-        nc = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
-        agg_shapes.append((B_size, nc, D))
-        n = nc
-
-    # Use XLA custom call
     result = jax_ffi.ffi_call(
         "cuda_scan_complex_fwd",
+        # result_shape_dtypes (positional)
         (
-            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
-            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_re
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_im
         ),
+        # input arrays (positional, variadic)
         A_re, A_im, U_re, U_im,
-        B_size=B_size,
-        T=T,
-        D=D,
-        M=M,
-        num_chunks=num_chunks,
-        num_levels=num_levels,
+        # opaque descriptor
+        opaque=opaque,
     )
 
     return result
@@ -160,7 +153,7 @@ def cuda_complex_scan(A: jnp.ndarray, U: jnp.ndarray,
 
     orig_shape = A.shape
     B_dim, T = orig_shape[0], orig_shape[1]
-    spatial = orig_shape[2:]  # e.g. (C, H, W_freq) — flatten for the kernel
+    spatial = orig_shape[2:]  # e.g. (C, H, W_freq)
 
     # Flatten spatial dims: (B, T, C, H, W_freq) -> (B, T, D)
     D = 1
@@ -190,8 +183,8 @@ def cuda_real_scan(A: jnp.ndarray, U: jnp.ndarray) -> jnp.ndarray:
     CUDA-accelerated parallel scan for real-valued scalar SSM.
 
     Convenience wrapper: passes real data as complex with zero imaginary part,
-    returns real output. For maximum performance, a dedicated real-valued kernel
-    (ssm_fwd_large.cu) can be integrated separately.
+    returns real output. For maximum performance at large scale, a dedicated
+    real-valued kernel (ssm_fwd_large.cu) can be integrated separately.
 
     Args:
         A: float32 (B, T, ...) — per-timestep decay
