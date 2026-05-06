@@ -336,6 +336,7 @@ class SimpleCSSM(nn.Module):
                 cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size
                 cssm_kwargs['short_conv_size'] = self.short_conv_size
                 cssm_kwargs['gate_type'] = self.gate_type
+                cssm_kwargs['scan_mode'] = self.scan_mode
             # NoFFTCSSM config
             if self.cssm_type == 'no_fft':
                 cssm_kwargs['short_conv_spatial_size'] = self.short_conv_spatial_size

@@ -428,6 +428,7 @@ class GatedCSSM(nn.Module):
     short_conv_size: int = 4       # Temporal causal conv kernel size (0=disabled)
     short_conv_spatial_size: int = 3  # Spatial depthwise conv kernel size (0=disabled)
     gate_type: str = 'dense'  # 'dense' (Dense(C→H*W_freq)) or 'factored' (Dense(C→H) × Dense(C→W_freq))
+    scan_mode: str = 'associative' # only for CUDA kernel activation for now
 
     def _compute_gate(self, x: jnp.ndarray) -> jnp.ndarray:
         """Compute input-dependent gate with specified activation."""
@@ -555,24 +556,43 @@ class GatedCSSM(nn.Module):
         # C — unconstrained linear projection (like Mamba)
         C_proj = _make_gate(ctx, 'C_proj', H, W_freq)
 
-        # --- 6. Convert to GOOM (log-space) ---
-        K_log = to_goom(K_hat)
-        K_log_broadcast = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
+        # --- 6-8. Scan (dispatch by scan_mode) ---
+        if self.scan_mode == 'cuda':
+            # Linear-space CUDA parallel scan (bypass GOOM)
+            # Equivalent transforms:
+            #   GOOM: K_log.real - delta  =>  linear: K_hat * exp(-delta)
+            #   GOOM: U_log.real + log(delta)  =>  linear: U_mod * delta
+            from .cuda_scan import cuda_complex_scan
 
-        U_modulated = U_hat * B_proj
-        U_log = to_goom(U_modulated)
+            K_hat_broadcast = jnp.broadcast_to(
+                K_hat[None, None, ...], U_hat.shape)
+            A_t = (K_hat_broadcast * jnp.exp(-delta_freq)).astype(jnp.complex64)
 
-        # --- 7. Apply Per-Frequency Δ Gating in Log-Space ---
-        K_log_gated = (K_log_broadcast.real - delta_freq) + 1j * K_log_broadcast.imag
-        U_log_gated = (U_log.real + jnp.log(delta_freq + 1e-8)) + 1j * U_log.imag
+            U_modulated = U_hat * B_proj
+            U_t = (U_modulated * delta_freq).astype(jnp.complex64)
 
-        # --- 8. Associative Scan (depthwise) ---
-        _, X_log = jax.lax.associative_scan(
-            cssm_scalar_scan_op, (K_log_gated, U_log_gated), axis=1
-        )
+            X_hat = cuda_complex_scan(A_t, U_t)
+        else:
+            # --- 6. Convert to GOOM (log-space) ---
+            K_log = to_goom(K_hat)
+            K_log_broadcast = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
+
+            U_modulated = U_hat * B_proj
+            U_log = to_goom(U_modulated)
+
+            # --- 7. Apply Per-Frequency Δ Gating in Log-Space ---
+            K_log_gated = (K_log_broadcast.real - delta_freq) + 1j * K_log_broadcast.imag
+            U_log_gated = (U_log.real + jnp.log(delta_freq + 1e-8)) + 1j * U_log.imag
+
+            # --- 8. Associative Scan (depthwise) ---
+            _, X_log = jax.lax.associative_scan(
+                cssm_scalar_scan_op, (K_log_gated, U_log_gated), axis=1
+            )
+
+            X_hat = from_goom(X_log)
 
         # --- 9. Apply C projection and Inverse Transform ---
-        X_hat = from_goom(X_log)
+        # X_hat = from_goom(X_log)
         X_hat_modulated = X_hat * C_proj
         ssm_out = jnp.fft.irfft2(X_hat_modulated, s=(H, W), axes=(3, 4))
         ssm_out = ssm_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
@@ -679,24 +699,38 @@ class GatedCSSM(nn.Module):
         C_gate_raw = nn.Dense(H * W_freq, name='C_gate')(ctx)
         C_gate = nn.sigmoid(C_gate_raw).reshape(B, T, 1, H, W_freq)
 
-        # --- 6. Convert to GOOM (log-space) ---
-        K_log = to_goom(K_hat)
-        K_log_broadcast = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
+        if self.scan_mode == 'cuda':
+            from .cuda_scan import cuda_complex_scan
 
-        U_modulated = U_hat * B_gate
-        U_log = to_goom(U_modulated)
+            K_hat_broadcast = jnp.broadcast_to(
+                K_hat[None, None, ...], U_hat.shape)
+            A_t = (K_hat_broadcast * jnp.exp(-delta_freq)).astype(jnp.complex64)
 
-        # --- 7. Apply Per-Frequency Δ Gating ---
-        K_log_gated = (K_log_broadcast.real - delta_freq) + 1j * K_log_broadcast.imag
-        U_log_gated = (U_log.real + jnp.log(delta_freq + 1e-8)) + 1j * U_log.imag
+            U_modulated = U_hat * B_gate
+            U_t = (U_modulated * delta_freq).astype(jnp.complex64)
 
-        # --- 8. Associative Scan (depthwise) ---
-        _, X_log = jax.lax.associative_scan(
-            cssm_scalar_scan_op, (K_log_gated, U_log_gated), axis=1
-        )
+            X_hat = cuda_complex_scan(A_t, U_t)
+        else:
+            # --- 6. Convert to GOOM (log-space) ---
+            K_log = to_goom(K_hat)
+            K_log_broadcast = jnp.broadcast_to(K_log[None, None, ...], U_hat.shape)
 
+            U_modulated = U_hat * B_gate
+            U_log = to_goom(U_modulated)
+
+            # --- 7. Apply Per-Frequency Δ Gating ---
+            K_log_gated = (K_log_broadcast.real - delta_freq) + 1j * K_log_broadcast.imag
+            U_log_gated = (U_log.real + jnp.log(delta_freq + 1e-8)) + 1j * U_log.imag
+
+            # --- 8. Associative Scan (depthwise) ---
+            _, X_log = jax.lax.associative_scan(
+                cssm_scalar_scan_op, (K_log_gated, U_log_gated), axis=1
+            )
+            
+            X_hat = from_goom(X_log)
+            
         # --- 9. Apply C gate ---
-        X_hat = from_goom(X_log)
+        # X_hat = from_goom(X_log)
         X_hat_gated = X_hat * C_gate  # (B, T, C, H, W_freq)
 
         # --- 10. Low-rank channel mixing in frequency domain ---
