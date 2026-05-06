@@ -124,7 +124,7 @@ def _cuda_scan_complex_fwd_impl(A_re, A_im, U_re, U_im):
             jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_re
             jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),  # h_im
         ),
-        custom_call_api_version=0,
+        custom_call_api_version=1,
         legacy_backend_config=opaque,
     )(A_re, A_im, U_re, U_im)
 
