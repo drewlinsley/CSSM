@@ -58,6 +58,12 @@ def _ensure_lib():
         platform="CUDA",
         api_version=0,
     )
+    jax.ffi.register_ffi_target(
+        "cuda_scan_complex_seq_fwd",
+        jax.ffi.pycapsule(lib.cuda_scan_complex_seq_fwd),
+        platform="CUDA",
+        api_version=0,
+    )
     _lib_loaded = True
 
 
@@ -83,6 +89,11 @@ def _scan_geometry(T: int):
 def _pack_descriptor(B_size, T, D, M, num_chunks, num_levels):
     """Pack scan parameters matching the C ScanDescriptor struct."""
     return struct.pack("llllli", B_size, T, D, M, num_chunks, num_levels)
+
+
+def _pack_seq_descriptor(B_size, T, D):
+    """Pack parameters matching the C SeqScanDescriptor struct."""
+    return struct.pack("lll", B_size, T, D)
 
 
 def _scan_op(carry_i, carry_j):
@@ -116,6 +127,35 @@ def _cuda_fwd_raw(A_re, A_im, U_re, U_im):
     return h_re, h_im
 
 
+def _cuda_seq_fwd_raw(A_re, A_im, U_re, U_im):
+    """Call the sequential CUDA kernel. For large D, moderate T."""
+    _ensure_lib()
+
+    B_size, T, D = A_re.shape
+    opaque = _pack_seq_descriptor(B_size, T, D)
+
+    h_re, h_im = jax.ffi.ffi_call(
+        "cuda_scan_complex_seq_fwd",
+        (
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
+            jax.ShapeDtypeStruct((B_size, T, D), jnp.float32),
+        ),
+        custom_call_api_version=1,
+        legacy_backend_config=opaque,
+    )(A_re, A_im, U_re, U_im)
+
+    return h_re, h_im
+
+
+# ============================================================================
+# Kernel dispatch threshold
+# ============================================================================
+# When D > T, memory coalescing dominates → use sequential kernel.
+# When T > D, parallelizing across T matters → use Blelloch kernel.
+# Tuned for NVIDIA L40S; may need adjustment for other GPUs.
+SEQ_THRESHOLD_RATIO = 1  # Use sequential when D >= T * ratio
+
+
 # ============================================================================
 # Differentiable public API
 # ============================================================================
@@ -125,6 +165,8 @@ def cuda_complex_scan(A, U):
     CUDA-accelerated parallel scan for complex scalar SSM.
 
     Computes h_t = A_t * h_{t-1} + U_t for all t in parallel.
+    Automatically dispatches between sequential kernel (large D, moderate T)
+    and Blelloch parallel scan (large T, moderate D).
 
     Args:
         A: complex64 (B, T, ...) — per-timestep decay
@@ -148,7 +190,11 @@ def cuda_complex_scan(A, U):
     U_re = U_flat.real.astype(jnp.float32)
     U_im = U_flat.imag.astype(jnp.float32)
 
-    h_re, h_im = _cuda_fwd_raw(A_re, A_im, U_re, U_im)
+    # Dispatch: sequential for large D (coalesced), Blelloch for large T (parallel)
+    if D >= T * SEQ_THRESHOLD_RATIO:
+        h_re, h_im = _cuda_seq_fwd_raw(A_re, A_im, U_re, U_im)
+    else:
+        h_re, h_im = _cuda_fwd_raw(A_re, A_im, U_re, U_im)
 
     # Kernel now outputs inclusive scan directly via finalize_inclusive_complex.
     h = (h_re + 1j * h_im).astype(jnp.complex64)

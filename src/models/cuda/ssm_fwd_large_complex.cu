@@ -466,4 +466,79 @@ void cuda_scan_complex_fwd(
         desc->M, desc->num_chunks, desc->num_levels);
 }
 
+// ============================================================================
+// Sequential scan: parallelize over D, loop over T
+// ============================================================================
+// For shapes with large D and moderate T (e.g. CSSM: D=9216, T=8-64).
+// Adjacent threads read adjacent d values → perfectly coalesced memory access.
+// No workspace buffers, no shared memory, state lives in registers.
+// O(T) sequential work per thread, O(B*D) parallelism.
+//
+// Descriptor is simpler — just (B, T, D), no M/chunks/levels needed.
+// ============================================================================
+
+struct SeqScanDescriptor {
+    long B_size;
+    long T;
+    long D;
+};
+
+__global__ void sequential_scan_complex_kernel(
+    const float *A_re, const float *A_im,
+    const float *U_re, const float *U_im,
+    float *h_re, float *h_im,
+    long B_size, long T, long D)
+{
+    long d = blockIdx.x * blockDim.x + threadIdx.x;
+    long b = blockIdx.y;
+
+    if (d >= D || b >= B_size)
+        return;
+
+    float state_re = 0.0f, state_im = 0.0f;
+
+    for (long t = 0; t < T; t++)
+    {
+        long idx = b * T * D + t * D + d;
+
+        float a_re = A_re[idx], a_im = A_im[idx];
+        float u_re = U_re[idx], u_im = U_im[idx];
+
+        // state = A * state + U  (complex multiply-add)
+        float new_re = (a_re * state_re - a_im * state_im) + u_re;
+        float new_im = (a_re * state_im + a_im * state_re) + u_im;
+        state_re = new_re;
+        state_im = new_im;
+
+        h_re[idx] = state_re;
+        h_im[idx] = state_im;
+    }
+}
+
+void cuda_scan_complex_seq_fwd(
+    cudaStream_t stream,
+    void **buffers,
+    const char *opaque,
+    size_t opaque_len)
+{
+    const SeqScanDescriptor *desc = (const SeqScanDescriptor *)opaque;
+
+    const float *A_re = (const float *)buffers[0];
+    const float *A_im = (const float *)buffers[1];
+    const float *U_re = (const float *)buffers[2];
+    const float *U_im = (const float *)buffers[3];
+
+    float *h_re = (float *)buffers[4];
+    float *h_im = (float *)buffers[5];
+
+    int threads = 256;
+    dim3 grid((desc->D + threads - 1) / threads, desc->B_size);
+    dim3 block(threads);
+
+    sequential_scan_complex_kernel<<<grid, block, 0, stream>>>(
+        A_re, A_im, U_re, U_im,
+        h_re, h_im,
+        desc->B_size, desc->T, desc->D);
+}
+
 }  // extern "C"
