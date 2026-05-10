@@ -26,14 +26,13 @@
 // ============================================================================
 // Descriptor struct — must match the kwargs packed by jax_ffi.ffi_call
 // ============================================================================
-struct ScanDescriptor
-{
+struct ScanDescriptor {
     long B_size;
     long T;
     long D;
     long M;
     long num_chunks;
-    int num_levels;
+    int  num_levels;
 };
 
 // ============================================================================
@@ -192,6 +191,7 @@ __global__ void __launch_bounds__(CHUNK_SIZE) parallel_scan_complex_kernel_fwd(
     __syncthreads();
 }
 
+
 // ============================================================================
 // Kernel: prefix propagation across chunks
 // ============================================================================
@@ -233,6 +233,88 @@ __global__ void __launch_bounds__(CHUNK_SIZE) apply_prefixes_complex(
     useq_im[idx] = (lA_re * pu_im + lA_im * pu_re) + lu_im;
 }
 
+
+// ============================================================================
+// Static workspace cache
+// ============================================================================
+//
+// TODO(library): Replace this static cache with JAX-managed workspace buffers
+// (declare as extra ffi_call outputs) before releasing as a library. The static
+// approach works for research (single model size per process) but:
+//   - Never freed (minor leak, cleaned up at process exit)
+//   - Not thread-safe
+//   - Breaks if two different model sizes run in the same process
+// See: https://jax.readthedocs.io/en/latest/ffi.html for the proper approach.
+//
+// ============================================================================
+
+#define MAX_LEVELS 32
+
+static struct {
+    float *Aseq_re, *Aseq_im, *useq_re, *useq_im;
+    float *Aagg_re[MAX_LEVELS], *Aagg_im[MAX_LEVELS];
+    float *uagg_re[MAX_LEVELS], *uagg_im[MAX_LEVELS];
+    float **Aagg_re_h, **Aagg_im_h, **uagg_re_h, **uagg_im_h;
+    long cached_B, cached_M, cached_D;
+    int  cached_num_levels;
+    bool initialized;
+} g_workspace = { .initialized = false };
+
+static void workspace_ensure(long B_size, long M, long D, int num_levels)
+{
+    if (g_workspace.initialized &&
+        g_workspace.cached_B == B_size &&
+        g_workspace.cached_M == M &&
+        g_workspace.cached_D == D &&
+        g_workspace.cached_num_levels == num_levels)
+    {
+        return;  // Already allocated with matching dimensions
+    }
+
+    // Free old buffers if dimensions changed
+    if (g_workspace.initialized)
+    {
+        cudaFree(g_workspace.Aseq_re);
+        cudaFree(g_workspace.Aseq_im);
+        cudaFree(g_workspace.useq_re);
+        cudaFree(g_workspace.useq_im);
+        for (int lev = 0; lev < g_workspace.cached_num_levels; lev++)
+        {
+            cudaFree(g_workspace.Aagg_re[lev]);
+            cudaFree(g_workspace.Aagg_im[lev]);
+            cudaFree(g_workspace.uagg_re[lev]);
+            cudaFree(g_workspace.uagg_im[lev]);
+        }
+    }
+
+    // Allocate seq buffers: (B, M, D)
+    size_t seq_bytes = B_size * M * D * sizeof(float);
+    cudaMalloc(&g_workspace.Aseq_re, seq_bytes);
+    cudaMalloc(&g_workspace.Aseq_im, seq_bytes);
+    cudaMalloc(&g_workspace.useq_re, seq_bytes);
+    cudaMalloc(&g_workspace.useq_im, seq_bytes);
+
+    // Allocate aggregate buffers per level
+    int n = M;
+    for (int lev = 0; lev < num_levels; lev++)
+    {
+        int nc = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        size_t agg_bytes = B_size * nc * D * sizeof(float);
+        cudaMalloc(&g_workspace.Aagg_re[lev], agg_bytes);
+        cudaMalloc(&g_workspace.Aagg_im[lev], agg_bytes);
+        cudaMalloc(&g_workspace.uagg_re[lev], agg_bytes);
+        cudaMalloc(&g_workspace.uagg_im[lev], agg_bytes);
+        n = nc;
+    }
+
+    g_workspace.cached_B = B_size;
+    g_workspace.cached_M = M;
+    g_workspace.cached_D = D;
+    g_workspace.cached_num_levels = num_levels;
+    g_workspace.initialized = true;
+}
+
+
 // ============================================================================
 // Host launcher (framework-agnostic, takes stream explicitly)
 // ============================================================================
@@ -246,7 +328,6 @@ static void launch_complex_scan(
 {
     if (T == 1)
     {
-        // Just copy input U to output h
         cudaMemcpyAsync(h_re, U_re, B_size * T * D * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
         cudaMemcpyAsync(h_im, U_im, B_size * T * D * sizeof(float),
@@ -254,38 +335,19 @@ static void launch_complex_scan(
         return;
     }
 
-    // --- Allocate workspace ---
-    // Aseq/useq: (B, M, D) — 4 buffers (re/im for A and u)
-    size_t seq_bytes = B_size * M * D * sizeof(float);
-    float *Aseq_re, *Aseq_im, *useq_re, *useq_im;
-    cudaMalloc(&Aseq_re, seq_bytes);
-    cudaMalloc(&Aseq_im, seq_bytes);
-    cudaMalloc(&useq_re, seq_bytes);
-    cudaMalloc(&useq_im, seq_bytes);
+    // Ensure workspace is allocated (no-op after first call with same dims)
+    workspace_ensure(B_size, M, D, num_levels);
 
-    // Aggregate buffers at each level: 4 arrays per level
-    float **Aagg_re_h = (float **)malloc(num_levels * sizeof(float *));
-    float **Aagg_im_h = (float **)malloc(num_levels * sizeof(float *));
-    float **uagg_re_h = (float **)malloc(num_levels * sizeof(float *));
-    float **uagg_im_h = (float **)malloc(num_levels * sizeof(float *));
-
-    int n = M;
-    for (int lev = 0; lev < num_levels; lev++)
-    {
-        int nc = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        size_t agg_bytes = B_size * nc * D * sizeof(float);
-        cudaMalloc(&Aagg_re_h[lev], agg_bytes);
-        cudaMalloc(&Aagg_im_h[lev], agg_bytes);
-        cudaMalloc(&uagg_re_h[lev], agg_bytes);
-        cudaMalloc(&uagg_im_h[lev], agg_bytes);
-        n = nc;
-    }
+    float *Aseq_re = g_workspace.Aseq_re;
+    float *Aseq_im = g_workspace.Aseq_im;
+    float *useq_re = g_workspace.useq_re;
+    float *useq_im = g_workspace.useq_im;
 
     // --- Phase 1/2: local Blelloch scan per chunk + save aggregates ---
     float *Aseq_ptr_re = Aseq_re, *Aseq_ptr_im = Aseq_im;
     float *useq_ptr_re = useq_re, *useq_ptr_im = useq_im;
-    int level_sizes[32];
-    n = M;
+    int level_sizes[MAX_LEVELS];
+    int n = M;
 
     for (int level = 0; level < num_levels; level++)
     {
@@ -297,14 +359,14 @@ static void launch_complex_scan(
             A_re, A_im, U_re, U_im,
             Aseq_ptr_re, Aseq_ptr_im,
             useq_ptr_re, useq_ptr_im,
-            Aagg_re_h[level], Aagg_im_h[level],
-            uagg_re_h[level], uagg_im_h[level],
+            g_workspace.Aagg_re[level], g_workspace.Aagg_im[level],
+            g_workspace.uagg_re[level], g_workspace.uagg_im[level],
             B_size, T, D, n, nc, level);
 
-        Aseq_ptr_re = Aagg_re_h[level];
-        Aseq_ptr_im = Aagg_im_h[level];
-        useq_ptr_re = uagg_re_h[level];
-        useq_ptr_im = uagg_im_h[level];
+        Aseq_ptr_re = g_workspace.Aagg_re[level];
+        Aseq_ptr_im = g_workspace.Aagg_im[level];
+        useq_ptr_re = g_workspace.uagg_re[level];
+        useq_ptr_im = g_workspace.uagg_im[level];
         level_sizes[level] = n;
         n = nc;
     }
@@ -312,10 +374,10 @@ static void launch_complex_scan(
     // --- Phase 3: propagate prefixes back down ---
     for (int level = num_levels - 1; level >= 0; level--)
     {
-        Aseq_ptr_re = (level == 0) ? Aseq_re : Aagg_re_h[level - 1];
-        Aseq_ptr_im = (level == 0) ? Aseq_im : Aagg_im_h[level - 1];
-        useq_ptr_re = (level == 0) ? useq_re : uagg_re_h[level - 1];
-        useq_ptr_im = (level == 0) ? useq_im : uagg_im_h[level - 1];
+        Aseq_ptr_re = (level == 0) ? Aseq_re : g_workspace.Aagg_re[level - 1];
+        Aseq_ptr_im = (level == 0) ? Aseq_im : g_workspace.Aagg_im[level - 1];
+        useq_ptr_re = (level == 0) ? useq_re : g_workspace.uagg_re[level - 1];
+        useq_ptr_im = (level == 0) ? useq_im : g_workspace.uagg_im[level - 1];
         int nc = (level_sizes[level] + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
         dim3 grid(D, B_size, nc);
@@ -324,8 +386,8 @@ static void launch_complex_scan(
         apply_prefixes_complex<<<grid, block, 0, stream>>>(
             Aseq_ptr_re, Aseq_ptr_im,
             useq_ptr_re, useq_ptr_im,
-            Aagg_re_h[level], Aagg_im_h[level],
-            uagg_re_h[level], uagg_im_h[level],
+            g_workspace.Aagg_re[level], g_workspace.Aagg_im[level],
+            g_workspace.uagg_re[level], g_workspace.uagg_im[level],
             B_size, D, level_sizes[level], nc);
     }
 
@@ -339,7 +401,6 @@ static void launch_complex_scan(
     }
     else
     {
-        // M > T: copy only the first T timesteps per batch
         for (long b = 0; b < B_size; b++)
         {
             cudaMemcpyAsync(
@@ -354,56 +415,38 @@ static void launch_complex_scan(
                 cudaMemcpyDeviceToDevice, stream);
         }
     }
-
-    // --- Free workspace ---
-    for (int lev = 0; lev < num_levels; lev++)
-    {
-        cudaFree(Aagg_re_h[lev]);
-        cudaFree(Aagg_im_h[lev]);
-        cudaFree(uagg_re_h[lev]);
-        cudaFree(uagg_im_h[lev]);
-    }
-    free(Aagg_re_h);
-    free(Aagg_im_h);
-    free(uagg_re_h);
-    free(uagg_im_h);
-
-    cudaFree(Aseq_re);
-    cudaFree(Aseq_im);
-    cudaFree(useq_re);
-    cudaFree(useq_im);
 }
+
 
 // ============================================================================
 // JAX FFI entry point
 // ============================================================================
-extern "C"
+extern "C" {
+
+void cuda_scan_complex_fwd(
+    cudaStream_t stream,
+    void **buffers,
+    const char *opaque,
+    size_t opaque_len)
 {
+    const ScanDescriptor *desc = (const ScanDescriptor *)opaque;
 
-    void cuda_scan_complex_fwd(
-        cudaStream_t stream,
-        void **buffers,
-        const char *opaque,
-        size_t opaque_len)
-    {
-        const ScanDescriptor *desc = (const ScanDescriptor *)opaque;
+    // Inputs (4 buffers)
+    const float *A_re = (const float *)buffers[0];
+    const float *A_im = (const float *)buffers[1];
+    const float *U_re = (const float *)buffers[2];
+    const float *U_im = (const float *)buffers[3];
 
-        // Inputs (4 buffers)
-        const float *A_re = (const float *)buffers[0];
-        const float *A_im = (const float *)buffers[1];
-        const float *U_re = (const float *)buffers[2];
-        const float *U_im = (const float *)buffers[3];
+    // Outputs (2 buffers, pre-allocated by JAX)
+    float *h_re = (float *)buffers[4];
+    float *h_im = (float *)buffers[5];
 
-        // Outputs (2 buffers, pre-allocated by JAX)
-        float *h_re = (float *)buffers[4];
-        float *h_im = (float *)buffers[5];
+    launch_complex_scan(
+        stream,
+        A_re, A_im, U_re, U_im,
+        h_re, h_im,
+        desc->B_size, desc->T, desc->D,
+        desc->M, desc->num_chunks, desc->num_levels);
+}
 
-        launch_complex_scan(
-            stream,
-            A_re, A_im, U_re, U_im,
-            h_re, h_im,
-            desc->B_size, desc->T, desc->D,
-            desc->M, desc->num_chunks, desc->num_levels);
-    }
-
-} // extern "C"
+}  // extern "C"
