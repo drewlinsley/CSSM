@@ -235,8 +235,37 @@ __global__ void __launch_bounds__(CHUNK_SIZE) apply_prefixes_complex(
 
 
 // ============================================================================
-// Static workspace cache
+// Kernel: convert exclusive scan to inclusive and write to output
 // ============================================================================
+// Replaces both the cudaMemcpyAsync (useq → h) AND the Python-side fixup.
+// Computes: h_inclusive[t] = A[t] * h_exclusive[t] + U[t]
+// Reads from useq (B, M, D), writes to h (B, T, D).
+//
+__global__ void finalize_inclusive_complex(
+    const float *A_re, const float *A_im,       // original inputs (B, T, D)
+    const float *U_re, const float *U_im,       // original inputs (B, T, D)
+    const float *excl_re, const float *excl_im,  // exclusive scan in useq (B, M, D)
+    float *h_re, float *h_im,                    // inclusive output (B, T, D)
+    long B_size, long T, long D, long M)
+{
+    int d = blockIdx.x;
+    int b = blockIdx.y;
+    int t = blockIdx.z * blockDim.x + threadIdx.x;
+
+    if (d >= D || b >= B_size || t >= T)
+        return;
+
+    long in_idx  = b * T * D + t * D + d;  // index into (B, T, D)
+    long exc_idx = b * M * D + t * D + d;  // index into (B, M, D)
+
+    // h[t] = A[t] * excl[t] + U[t]  (complex multiply-add)
+    float a_re = A_re[in_idx],    a_im = A_im[in_idx];
+    float e_re = excl_re[exc_idx], e_im = excl_im[exc_idx];
+    float u_re = U_re[in_idx],    u_im = U_im[in_idx];
+
+    h_re[in_idx] = (a_re * e_re - a_im * e_im) + u_re;
+    h_im[in_idx] = (a_re * e_im + a_im * e_re) + u_im;
+}
 //
 // TODO(library): Replace this static cache with JAX-managed workspace buffers
 // (declare as extra ffi_call outputs) before releasing as a library. The static
@@ -391,29 +420,17 @@ static void launch_complex_scan(
             B_size, D, level_sizes[level], nc);
     }
 
-    // --- Copy results: useq[:, :T, :] -> h (output) ---
-    if (M == T)
+    // --- Phase 4: convert exclusive→inclusive and write to output ---
     {
-        cudaMemcpyAsync(h_re, useq_re, B_size * T * D * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(h_im, useq_im, B_size * T * D * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-    }
-    else
-    {
-        for (long b = 0; b < B_size; b++)
-        {
-            cudaMemcpyAsync(
-                h_re + b * T * D,
-                useq_re + b * M * D,
-                T * D * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(
-                h_im + b * T * D,
-                useq_im + b * M * D,
-                T * D * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream);
-        }
+        int t_blocks = (T + 255) / 256;
+        dim3 grid(D, B_size, t_blocks);
+        dim3 block(256);
+
+        finalize_inclusive_complex<<<grid, block, 0, stream>>>(
+            A_re, A_im, U_re, U_im,
+            useq_re, useq_im,
+            h_re, h_im,
+            B_size, T, D, M);
     }
 }
 
