@@ -150,7 +150,12 @@ def cuda_complex_scan(A, U):
 
     h_re, h_im = _cuda_fwd_raw(A_re, A_im, U_re, U_im)
 
-    h = (h_re + 1j * h_im).astype(jnp.complex64)
+    # h = (h_re + 1j * h_im).astype(jnp.complex64)
+
+    # Handle inclusive conversion
+    h_excl = (h_re + 1j * h_im).astype(jnp.complex64)
+    h = A_flat * h_excl.reshape(B_dim, T, D) + U_flat
+    
     return h.reshape(orig_shape)
 
 
