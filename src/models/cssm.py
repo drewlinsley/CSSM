@@ -568,6 +568,10 @@ class GatedCSSM(nn.Module):
                 K_hat[None, None, ...], U_hat.shape)
             A_t = (K_hat_broadcast * jnp.exp(-delta_freq)).astype(jnp.complex64)
 
+            # Stability clamp: keep |A_t| < 1 to prevent unbounded growth
+            mag = jnp.abs(A_t)
+            A_t = jnp.where(mag > 0.999, A_t * (0.999 / (mag + 1e-8)), A_t)
+
             U_modulated = U_hat * B_proj
             U_t = (U_modulated * delta_freq).astype(jnp.complex64)
 
